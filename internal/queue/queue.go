@@ -17,28 +17,59 @@ import (
 
 // Job is a single download to perform.
 type Job struct {
-	Link   dlc.Link
+	// Link is the DLC entry to download.
+	Link dlc.Link
+	// Hoster resolves Link.URL to a direct download URL. A nil Hoster
+	// causes [Run] to emit [EventSkipped] for this job.
 	Hoster hoster.Hoster
+	// OutDir is the directory the final file is written into.
 	OutDir string
 }
 
-// EventKind describes the type of a JobEvent.
+// EventKind describes the type of an [Event].
 type EventKind int
 
 const (
+	// EventStarted is emitted once a job begins, before resolution.
 	EventStarted EventKind = iota
+	// EventResolved is emitted after the hoster returns a direct download URL.
 	EventResolved
+	// EventProgress is emitted periodically while bytes are being received.
 	EventProgress
+	// EventDone is emitted after the file has been written to its destination.
 	EventDone
+	// EventFailed is emitted when a job errors at any stage; Err is set.
 	EventFailed
+	// EventSkipped is emitted when a job is intentionally not run
+	// (no hoster, or the destination file already exists).
 	EventSkipped
 )
+
+// String returns the constant's identifier (e.g. "EventStarted").
+func (k EventKind) String() string {
+	switch k {
+	case EventStarted:
+		return "EventStarted"
+	case EventResolved:
+		return "EventResolved"
+	case EventProgress:
+		return "EventProgress"
+	case EventDone:
+		return "EventDone"
+	case EventFailed:
+		return "EventFailed"
+	case EventSkipped:
+		return "EventSkipped"
+	default:
+		return fmt.Sprintf("EventKind(%d)", int(k))
+	}
+}
 
 // Event reports queue progress. Total may be -1 if unknown.
 type Event struct {
 	Kind        EventKind
-	Index       int    // 0-based index within the supplied job slice
-	Total       int    // total number of jobs
+	Index       int // 0-based index within the supplied job slice
+	Total       int // total number of jobs
 	Link        dlc.Link
 	Hoster      string // hoster name, e.g. "rapidgator" (empty for EventSkipped due to no hoster)
 	Filename    string // populated once known
@@ -50,9 +81,10 @@ type Event struct {
 }
 
 // ErrCollision is set on Event.Err when a job is skipped because the
-// destination file already exists. Callers can use errors.As to detect
+// destination file already exists. Callers can use [errors.As] to detect
 // this case and offer the user an overwrite/rename prompt.
 type ErrCollision struct {
+	// Path is the destination file that already exists.
 	Path string
 }
 
@@ -63,8 +95,11 @@ func (e *ErrCollision) Error() string {
 // EventFn receives queue events. Implementations should be cheap.
 type EventFn func(Event)
 
-// Run executes jobs in order. A failure in one job is reported as EventFailed
-// and execution continues with the next job, unless ctx is canceled.
+// Run executes jobs in order on the caller's goroutine. A failure in one job
+// is reported as EventFailed and execution continues with the next job,
+// unless ctx is canceled (in which case Run returns ctx.Err() without
+// emitting a failure event for the cancelled job). Sequential execution is
+// intentional — do not introduce fan-out here.
 func Run(ctx context.Context, jobs []Job, on EventFn) error {
 	emit := func(e Event) {
 		if on != nil {
@@ -89,6 +124,9 @@ func Run(ctx context.Context, jobs []Job, on EventFn) error {
 
 		resolved, err := job.Hoster.Resolve(ctx, job.Link.URL)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			ev := base
 			ev.Kind = EventFailed
 			ev.Err = fmt.Errorf("resolve: %w", err)
@@ -152,6 +190,9 @@ func Run(ctx context.Context, jobs []Job, on EventFn) error {
 			emit(ev)
 		}, downloader.Options{})
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			ev := base
 			ev.Kind = EventFailed
 			ev.Filename = filename

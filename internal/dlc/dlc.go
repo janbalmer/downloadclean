@@ -9,10 +9,12 @@ package dlc
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,11 +31,19 @@ import (
 // Parser.ServiceURL directly.
 const DefaultServiceURL = "http://service.jdownloader.org/dlcrypt/service.php?srcType=dlc&destType=pylo&data=%s"
 
-// Hardcoded first-pass AES-CBC key/IV (from pyLoad's DLC plugin).
+// Hardcoded first-pass AES-CBC key/IV (from pyLoad's DLC plugin). These are
+// the literal 16-byte ASCII sequences (NOT hex-decoded) used by pyLoad and
+// AppWork — interop with the format requires these exact bytes. IV reuse
+// here is safe because we only ever decrypt with this key, never encrypt.
 var (
 	firstPassKey = []byte("cb99b5cbc24db398")
 	firstPassIV  = []byte("9bc24cb995cb8db3")
 )
+
+// maxServiceResponseBytes caps the dlcrypt service response. Real responses
+// are a few hundred bytes (a base64-encoded 32-byte ciphertext inside an XML
+// element); 64 KiB is generous insurance against a misbehaving mirror.
+const maxServiceResponseBytes = 64 << 10
 
 // Link is a single downloadable entry inside a DLC.
 type Link struct {
@@ -46,24 +56,24 @@ type Link struct {
 // Parser decrypts DLC files. The zero value is usable.
 type Parser struct {
 	// ServiceURL is a printf-style format string with one %s placeholder for
-	// the URL-encoded key blob. Empty means use DefaultServiceURL (or the
+	// the URL-encoded key blob. Empty means use [DefaultServiceURL] (or the
 	// DOWNLOADCLEAN_DLC_SERVICE env var if set).
 	ServiceURL string
 	// HTTPClient overrides the default client used to call the service.
 	HTTPClient *http.Client
-
-	defaultOnce   sync.Once
-	defaultClient *http.Client
 }
+
+// defaultDLCClient is shared across all zero-value Parsers; the service
+// is stateless, so reusing one client improves connection pooling.
+var defaultDLCClient = sync.OnceValue(func() *http.Client {
+	return &http.Client{Timeout: 30 * time.Second}
+})
 
 func (p *Parser) client() *http.Client {
 	if p.HTTPClient != nil {
 		return p.HTTPClient
 	}
-	p.defaultOnce.Do(func() {
-		p.defaultClient = &http.Client{Timeout: 30 * time.Second}
-	})
-	return p.defaultClient
+	return defaultDLCClient()
 }
 
 func (p *Parser) serviceURL() string {
@@ -76,8 +86,9 @@ func (p *Parser) serviceURL() string {
 	return DefaultServiceURL
 }
 
-// Parse reads a DLC file from r and returns its links.
-func (p *Parser) Parse(r io.Reader) ([]Link, error) {
+// Parse reads a DLC file from r and returns its links. The context is used
+// for the dlcrypt service call; cancelling it aborts an in-flight decryption.
+func (p *Parser) Parse(ctx context.Context, r io.Reader) ([]Link, error) {
 	raw, err := io.ReadAll(r)
 	if err != nil {
 		return nil, fmt.Errorf("read dlc: %w", err)
@@ -89,7 +100,7 @@ func (p *Parser) Parse(r io.Reader) ([]Link, error) {
 	keyBlob := raw[len(raw)-88:]
 	body := raw[:len(raw)-88]
 
-	derivedKey, err := p.fetchKey(string(keyBlob))
+	derivedKey, err := p.fetchKey(ctx, string(keyBlob))
 	if err != nil {
 		return nil, err
 	}
@@ -114,9 +125,17 @@ func (p *Parser) Parse(r io.Reader) ([]Link, error) {
 
 // fetchKey calls the dlcrypt service with the 88-byte key blob and returns
 // the 16-byte derived key used for the second AES-CBC pass.
-func (p *Parser) fetchKey(keyBlob string) ([]byte, error) {
-	endpoint := fmt.Sprintf(p.serviceURL(), url.QueryEscape(keyBlob))
-	resp, err := p.client().Get(endpoint)
+func (p *Parser) fetchKey(ctx context.Context, keyBlob string) ([]byte, error) {
+	svc := p.serviceURL()
+	if strings.Count(svc, "%s") != 1 {
+		return nil, fmt.Errorf("dlc service URL %q must contain exactly one %%s placeholder", svc)
+	}
+	endpoint := fmt.Sprintf(svc, url.QueryEscape(keyBlob))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("dlc service: %w", err)
+	}
+	resp, err := p.client().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("dlc service: %w", err)
 	}
@@ -124,9 +143,12 @@ func (p *Parser) fetchKey(keyBlob string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("dlc service: HTTP %d", resp.StatusCode)
 	}
-	xmlBody, err := io.ReadAll(resp.Body)
+	xmlBody, err := io.ReadAll(io.LimitReader(resp.Body, maxServiceResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("dlc service: read: %w", err)
+	}
+	if len(xmlBody) > maxServiceResponseBytes {
+		return nil, fmt.Errorf("dlc service: response exceeds %d bytes", maxServiceResponseBytes)
 	}
 
 	rcText, err := extractRC(xmlBody)
@@ -154,7 +176,7 @@ func extractRC(xmlBody []byte) (string, error) {
 	dec := xml.NewDecoder(bytes.NewReader(xmlBody))
 	for {
 		tok, err := dec.Token()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			return "", fmt.Errorf("no <rc> element found")
 		}
 		if err != nil {

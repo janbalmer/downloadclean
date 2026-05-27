@@ -56,7 +56,7 @@ func TestParse_RoundTrip(t *testing.T) {
 	defer srv.Close()
 
 	p := &Parser{ServiceURL: srv.URL + "?data=%s"}
-	links, err := p.Parse(bytes.NewReader([]byte(bodyB64 + keyBlob)))
+	links, err := p.Parse(t.Context(), bytes.NewReader([]byte(bodyB64 + keyBlob)))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestParse_ServiceError(t *testing.T) {
 	defer srv.Close()
 
 	p := &Parser{ServiceURL: srv.URL + "?data=%s"}
-	_, err := p.Parse(bytes.NewReader([]byte(strings.Repeat("A", 200))))
+	_, err := p.Parse(t.Context(), bytes.NewReader([]byte(strings.Repeat("A", 200))))
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -95,9 +95,22 @@ func TestParse_ServiceError(t *testing.T) {
 
 func TestParse_TooShort(t *testing.T) {
 	p := &Parser{ServiceURL: "http://unused/?data=%s"}
-	_, err := p.Parse(bytes.NewReader([]byte("short")))
+	_, err := p.Parse(t.Context(), bytes.NewReader([]byte("short")))
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestParse_ServiceURLMissingPlaceholder(t *testing.T) {
+	// A URL without exactly one %s would mangle silently via fmt.Sprintf — the
+	// validation must reject it.
+	p := &Parser{ServiceURL: "http://nope/no-placeholder"}
+	_, err := p.Parse(t.Context(), bytes.NewReader([]byte(strings.Repeat("A", 200))))
+	if err == nil {
+		t.Fatal("expected error for missing placeholder")
+	}
+	if !strings.Contains(err.Error(), "placeholder") {
+		t.Errorf("error should mention placeholder: %v", err)
 	}
 }
 
@@ -114,19 +127,21 @@ func TestExtractRC(t *testing.T) {
 		{`<no-rc-here/>`, "", true},
 	}
 	for _, c := range cases {
-		got, err := extractRC([]byte(c.in))
-		if c.err {
-			if err == nil {
-				t.Errorf("extractRC(%q): expected error, got %q", c.in, got)
+		t.Run(c.in, func(t *testing.T) {
+			got, err := extractRC([]byte(c.in))
+			if c.err {
+				if err == nil {
+					t.Errorf("expected error, got %q", got)
+				}
+				return
 			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("extractRC(%q): unexpected error: %v", c.in, err)
-		}
-		if got != c.want {
-			t.Errorf("extractRC(%q) = %q, want %q", c.in, got, c.want)
-		}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
@@ -136,15 +151,17 @@ func TestStripPKCS7(t *testing.T) {
 	}{
 		{[]byte{1, 2, 3, 0x05, 0x05, 0x05, 0x05, 0x05}, []byte{1, 2, 3}},
 		{[]byte{0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10}, []byte{}},
-		{[]byte{1, 2, 3, 4}, []byte{1, 2, 3, 4}},          // pad value 4 but no preceding 4s -> unchanged
-		{[]byte{1, 2, 3, 0}, []byte{1, 2, 3, 0}},          // pad value 0 -> unchanged
-		{[]byte{1, 2, 3, 0x20}, []byte{1, 2, 3, 0x20}},    // pad value > blocksize -> unchanged
+		{[]byte{1, 2, 3, 4}, []byte{1, 2, 3, 4}},       // pad value 4 but no preceding 4s -> unchanged
+		{[]byte{1, 2, 3, 0}, []byte{1, 2, 3, 0}},       // pad value 0 -> unchanged
+		{[]byte{1, 2, 3, 0x20}, []byte{1, 2, 3, 0x20}}, // pad value > blocksize -> unchanged
 	}
 	for i, c := range cases {
-		got := stripPKCS7(c.in)
-		if !bytes.Equal(got, c.want) {
-			t.Errorf("case %d: stripPKCS7(%v) = %v, want %v", i, c.in, got, c.want)
-		}
+		t.Run(fmt.Sprintf("case%d", i), func(t *testing.T) {
+			got := stripPKCS7(c.in)
+			if !bytes.Equal(got, c.want) {
+				t.Errorf("stripPKCS7(%v) = %v, want %v", c.in, got, c.want)
+			}
+		})
 	}
 }
 

@@ -1,12 +1,15 @@
 package rapidgator
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/janbalmer/downloadclean/internal/hoster"
 )
 
 func TestFileID(t *testing.T) {
@@ -22,19 +25,21 @@ func TestFileID(t *testing.T) {
 		{"", "", true},
 	}
 	for _, c := range cases {
-		got, err := FileID(c.in)
-		if c.err {
-			if err == nil {
-				t.Errorf("FileID(%q): expected error, got %q", c.in, got)
+		t.Run(c.in, func(t *testing.T) {
+			got, err := FileID(c.in)
+			if c.err {
+				if err == nil {
+					t.Errorf("expected error, got %q", got)
+				}
+				return
 			}
-			continue
-		}
-		if err != nil {
-			t.Errorf("FileID(%q): unexpected error: %v", c.in, err)
-		}
-		if got != c.want {
-			t.Errorf("FileID(%q) = %q, want %q", c.in, got, c.want)
-		}
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
 	}
 }
 
@@ -72,7 +77,7 @@ func TestResolve_Success(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{Login: "user", Password: "pw", BaseURL: srv.URL}
-	res, err := c.Resolve(context.Background(), "https://rapidgator.net/file/abc123/foo.rar.html")
+	res, err := c.Resolve(t.Context(), "https://rapidgator.net/file/abc123/foo.rar.html")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -84,7 +89,7 @@ func TestResolve_Success(t *testing.T) {
 	}
 
 	// Second Resolve should reuse the cached token (no extra login).
-	_, err = c.Resolve(context.Background(), "https://rapidgator.net/file/abc123/foo.rar.html")
+	_, err = c.Resolve(t.Context(), "https://rapidgator.net/file/abc123/foo.rar.html")
 	if err != nil {
 		t.Fatalf("Resolve 2: %v", err)
 	}
@@ -115,7 +120,7 @@ func TestResolve_TokenRefresh(t *testing.T) {
 	c := &Client{Login: "u", Password: "p", BaseURL: srv.URL}
 	c.token = "STALE" // pretend we have a cached but expired token
 
-	res, err := c.Resolve(context.Background(), "https://rapidgator.net/file/zzz/y.rar")
+	res, err := c.Resolve(t.Context(), "https://rapidgator.net/file/zzz/y.rar")
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -134,8 +139,67 @@ func TestResolve_BadCreds(t *testing.T) {
 	defer srv.Close()
 
 	c := &Client{Login: "u", Password: "p", BaseURL: srv.URL}
-	_, err := c.Resolve(context.Background(), "https://rapidgator.net/file/abc/x")
+	_, err := c.Resolve(t.Context(), "https://rapidgator.net/file/abc/x")
 	if err == nil {
 		t.Fatal("expected error")
+	}
+	var authErr *hoster.ErrAuth
+	if !errors.As(err, &authErr) {
+		t.Errorf("expected *hoster.ErrAuth, got %T: %v", err, err)
+	}
+}
+
+// TestResolve_BodyLevelAuthRefresh covers the common Rapidgator pattern of
+// returning HTTP 200 with {"status":401,...} in the body for an expired
+// session. The client must detect that, refresh the token, and retry.
+func TestResolve_BodyLevelAuthRefresh(t *testing.T) {
+	var loginHits, downloadHits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/user/login":
+			n := atomic.AddInt32(&loginHits, 1)
+			fmt.Fprintf(w, `{"response":{"token":"T%d"},"status":200}`, n)
+		case "/api/v2/file/download":
+			// First call: HTTP 200 with an API-level 401 in the body.
+			if atomic.AddInt32(&downloadHits, 1) == 1 {
+				fmt.Fprint(w, `{"status":401,"details":"Session not exist"}`)
+				return
+			}
+			fmt.Fprint(w, `{"response":{"download_url":"https://dl/x","filename":"x","size":7},"status":200}`)
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{Login: "u", Password: "p", BaseURL: srv.URL}
+	c.token = "STALE"
+
+	res, err := c.Resolve(t.Context(), "https://rapidgator.net/file/zzz/y.rar")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if res.DirectURL != "https://dl/x" {
+		t.Errorf("DirectURL = %q", res.DirectURL)
+	}
+	if got := atomic.LoadInt32(&loginHits); got != 1 {
+		t.Errorf("login hits = %d, want 1 (body-level 401 didn't trigger refresh)", got)
+	}
+}
+
+// TestResolve_CredentialsNotInErrorChain confirms that a transport error
+// from the rapidgator client does not leak credentials through the wrapped
+// *url.Error (which by default stringifies the full URL including the query).
+func TestResolve_CredentialsNotInErrorChain(t *testing.T) {
+	c := &Client{
+		Login:    "leak-user",
+		Password: "leak-password-do-not-include",
+		// Point at an unreachable address to force a transport error.
+		BaseURL: "http://127.0.0.1:1",
+	}
+	_, err := c.Resolve(t.Context(), "https://rapidgator.net/file/abc/x")
+	if err == nil {
+		t.Fatal("expected transport error")
+	}
+	if msg := err.Error(); strings.Contains(msg, "leak-password-do-not-include") || strings.Contains(msg, "leak-user") {
+		t.Errorf("credentials leaked into error: %s", msg)
 	}
 }

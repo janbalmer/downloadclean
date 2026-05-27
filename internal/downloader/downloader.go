@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,8 @@ type ProgressFn func(downloaded, total int64)
 
 // Options configures Download. Zero values use sensible defaults.
 type Options struct {
+	// HTTPClient overrides the HTTP client used for the download. Nil means
+	// a default client with no overall timeout (suitable for large files).
 	HTTPClient *http.Client
 	// ProgressInterval throttles progress callbacks. Default: 100ms.
 	ProgressInterval time.Duration
@@ -59,14 +62,21 @@ func Download(ctx context.Context, url, dest string, p ProgressFn, opts Options)
 		// Server ignored our Range request (or we had no offset). Start fresh.
 		startOffset = 0
 	case http.StatusPartialContent:
-		// Server honored the Range request; we'll append.
+		// Server honored the Range request. Validate Content-Range so a server
+		// that returns 206 but with the wrong offset can't silently corrupt the
+		// resume.
+		if cr := resp.Header.Get("Content-Range"); cr != "" {
+			if start, ok := parseContentRangeStart(cr); !ok || start != startOffset {
+				return fmt.Errorf("download: server returned 206 with Content-Range %q, want start=%d", cr, startOffset)
+			}
+		}
 	default:
 		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
 	}
 
-	total := startOffset + resp.ContentLength
-	if resp.ContentLength < 0 {
-		total = -1
+	total := int64(-1)
+	if resp.ContentLength >= 0 {
+		total = startOffset + resp.ContentLength
 	}
 
 	flag := os.O_CREATE | os.O_WRONLY
@@ -95,9 +105,13 @@ func Download(ctx context.Context, url, dest string, p ProgressFn, opts Options)
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("download: close: %w", err)
 	}
-	// One final progress tick at 100%.
+	// One final progress tick at 100%. If total was unknown, it equals count now.
 	if p != nil {
-		p(pr.count, pr.total)
+		finalTotal := pr.total
+		if finalTotal < 0 {
+			finalTotal = pr.count
+		}
+		p(pr.count, finalTotal)
 	}
 	if err := os.Rename(part, dest); err != nil {
 		return fmt.Errorf("download: rename: %w", err)
@@ -126,16 +140,20 @@ func (pr *progressReader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// ParseContentLength is exposed for callers (and tests) that want to parse
-// the Content-Length header into an int64. Returns -1 when missing or invalid.
-func ParseContentLength(h http.Header) int64 {
-	s := h.Get("Content-Length")
-	if s == "" {
-		return -1
+// parseContentRangeStart returns the start byte from a Content-Range header
+// of the form "bytes <start>-<end>/<total>". Returns (0, false) on parse error.
+func parseContentRangeStart(h string) (int64, bool) {
+	rest, ok := strings.CutPrefix(h, "bytes ")
+	if !ok {
+		return 0, false
 	}
-	n, err := strconv.ParseInt(s, 10, 64)
+	startStr, _, ok := strings.Cut(rest, "-")
+	if !ok {
+		return 0, false
+	}
+	start, err := strconv.ParseInt(startStr, 10, 64)
 	if err != nil {
-		return -1
+		return 0, false
 	}
-	return n
+	return start, true
 }

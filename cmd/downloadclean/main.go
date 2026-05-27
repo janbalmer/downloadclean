@@ -1,4 +1,4 @@
-// downloadclean is a JDownloader-style sequential link grabber.
+// Command downloadclean is a JDownloader-style sequential link grabber.
 // v1 is CLI-only; a Bubble Tea TUI will land in a later iteration.
 package main
 
@@ -40,6 +40,12 @@ func run() error {
 		flag.Usage()
 		return fmt.Errorf("--dlc is required")
 	}
+	if *limit < 0 {
+		return fmt.Errorf("--limit must be >= 0")
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	dlcFile, err := os.Open(*dlcPath)
 	if err != nil {
@@ -48,7 +54,7 @@ func run() error {
 	defer dlcFile.Close()
 
 	parser := &dlc.Parser{}
-	links, err := parser.Parse(dlcFile)
+	links, err := parser.Parse(ctx, dlcFile)
 	if err != nil {
 		return fmt.Errorf("parse dlc: %w", err)
 	}
@@ -64,6 +70,9 @@ func run() error {
 		return nil
 	}
 
+	if *insecure {
+		fmt.Fprintln(os.Stderr, "warning: --insecure-config: skipping file-permission checks on accounts.json")
+	}
 	accs, err := config.Load(*accountsPath, *insecure)
 	if err != nil {
 		return err
@@ -74,9 +83,12 @@ func run() error {
 		reg.Register(rapidgator.New(accs.Rapidgator.Login, accs.Rapidgator.Password))
 	}
 
-	if *limit > 0 && *limit < len(links) {
-		fmt.Fprintf(os.Stderr, "limit: taking first %d of %d link(s)\n", *limit, len(links))
-		links = links[:*limit]
+	if *limit > 0 {
+		n := min(*limit, len(links))
+		if n < len(links) {
+			fmt.Fprintf(os.Stderr, "limit: taking first %d of %d link(s)\n", n, len(links))
+			links = links[:n]
+		}
 	}
 
 	jobs := make([]queue.Job, 0, len(links))
@@ -84,9 +96,6 @@ func run() error {
 		h := reg.Find(l.URL)
 		jobs = append(jobs, queue.Job{Link: l, Hoster: h, OutDir: *outDir})
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
 
 	printer := newPrinter()
 	if err := queue.Run(ctx, jobs, printer.handle); err != nil {
