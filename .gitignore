@@ -1,0 +1,23 @@
+# Credentials — never commit
+accounts.json
+**/accounts.json
+*.accounts.json
+.env
+.env.*
+
+# Build / tool output
+/downloadclean
+/downloadclean-tui
+/bin/
+/dist/
+*.exe
+
+# Test artefacts and downloads
+/downloads/
+/tmp/
+*.part
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
