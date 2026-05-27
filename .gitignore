@@ -16,6 +16,7 @@ accounts.json
 /downloads/
 /tmp/
 *.part
+*.dlc
 
 # Editor / OS
 .vscode/
