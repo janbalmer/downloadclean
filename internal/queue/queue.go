@@ -219,9 +219,12 @@ func eventWith(base Event, kind EventKind, desc string) Event {
 }
 
 // pickFilename picks the best filename available, in priority order:
-// hoster-provided, dlc-provided, direct URL basename, then public URL basename.
+// dlc-provided, hoster-provided, direct URL basename, then public URL basename.
+// The dlc name wins so the on-disk file matches what the user saw in their
+// container and the TUI's parsed-list view; hosters often rewrite the name
+// (Rapidgator returns an opaque CDN filename) which is less recognisable.
 func pickFilename(hosterName, dlcName, publicURL, directURL string) string {
-	for _, c := range []string{hosterName, dlcName} {
+	for _, c := range []string{dlcName, hosterName} {
 		c = strings.TrimSpace(c)
 		if c != "" {
 			return sanitize(c)

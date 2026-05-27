@@ -313,6 +313,11 @@ func viewDownloading(m model) string {
 		m.active.filename,
 	)
 
+	partLine := ""
+	if m.active.destPath != "" {
+		partLine = th.Muted.Render("→ " + m.active.destPath + ".part")
+	}
+
 	pct := 0.0
 	if m.active.sizeBytes > 0 {
 		pct = float64(m.active.downloaded) / float64(m.active.sizeBytes)
@@ -352,14 +357,18 @@ func viewDownloading(m model) string {
 	batchLabel := th.ProgressLabel.Render(
 		fmt.Sprintf("[%d/%d completed]", finished, m.active.total))
 
-	activePanel := th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left,
-		header,
+	activeRows := []string{header}
+	if partLine != "" {
+		activeRows = append(activeRows, partLine)
+	}
+	activeRows = append(activeRows,
 		"",
 		m.progressFile.View()+"  "+pctLabel,
 		stats,
 		"",
 		m.progressBatch.View()+"  "+batchLabel,
-	))
+	)
+	activePanel := th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left, activeRows...))
 
 	recentHeader := th.Subtitle.Render("recent:")
 	var rows []string
@@ -512,6 +521,7 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 		m.active.total = ev.Total
 		m.active.hosterName = ev.Hoster
 		m.active.filename = displayName(ev.Link)
+		m.active.destPath = ""
 		m.active.downloaded = 0
 		m.active.sizeBytes = -1
 		m.active.lastSampleAt = time.Time{}
@@ -521,6 +531,7 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 
 	case queue.EventResolved:
 		m.active.sizeBytes = ev.SizeBytes
+		m.active.destPath = ev.DestPath
 		return nil
 
 	case queue.EventProgress:

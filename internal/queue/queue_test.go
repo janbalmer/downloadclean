@@ -195,8 +195,9 @@ func TestPickFilename(t *testing.T) {
 		hosterName, dlcName, publicURL, directURL string
 		want                                       string
 	}{
-		{"hoster-wins", "from_hoster.rar", "from_dlc", "https://x/foo", "https://y/bar", "from_hoster.rar"},
-		{"dlc-fallback", "", "from_dlc.rar", "https://x/foo", "", "from_dlc.rar"},
+		{"dlc-wins", "from_hoster.rar", "from_dlc", "https://x/foo", "https://y/bar", "from_dlc"},
+		{"hoster-fallback", "from_hoster.rar", "", "https://x/foo", "https://y/bar", "from_hoster.rar"},
+		{"dlc-set-only", "", "from_dlc.rar", "https://x/foo", "", "from_dlc.rar"},
 		{"direct-url-fallback", "", "", "https://public/page", "https://cdn/real.bin", "real.bin"},
 		{"public-url-fallback", "", "", "https://public/page.html", "", "page.html"},
 		{"sanitize-strips-separators", "../../etc/passwd", "", "", "", ".._.._etc_passwd"},

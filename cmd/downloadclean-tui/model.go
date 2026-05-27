@@ -46,6 +46,7 @@ type activeJob struct {
 	total          int
 	hosterName     string
 	filename       string
+	destPath       string
 	downloaded     int64
 	sizeBytes      int64
 	lastSampleAt   time.Time
