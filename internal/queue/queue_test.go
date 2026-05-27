@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/janbalmer/downloadclean/internal/dlc"
@@ -186,6 +187,93 @@ func TestRun_ContextCancelDuringResolve(t *testing.T) {
 	}
 	if failed != 0 {
 		t.Errorf("expected 0 EventFailed (cancellation isn't a failure), got %d", failed)
+	}
+}
+
+func TestRunner_AppendDuringRun(t *testing.T) {
+	payload := []byte("xx")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload)
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+
+	// Gate the first resolve until the test appends two more jobs. Subsequent
+	// resolves run without blocking, so the runner drains the appended jobs.
+	gate := make(chan struct{})
+	var firstOnce bool
+	h := &fakeHoster{
+		name: "fake",
+		resolve: func(ctx context.Context, link string) (hoster.Resolved, error) {
+			if !firstOnce {
+				firstOnce = true
+				<-gate
+			}
+			return hoster.Resolved{DirectURL: srv.URL, Filename: link[strings.LastIndex(link, "/")+1:], Size: int64(len(payload))}, nil
+		},
+	}
+
+	mkJob := func(name string, batch int) Job {
+		return Job{
+			Link:    dlc.Link{URL: "https://example/" + name},
+			Hoster:  h,
+			OutDir:  dir,
+			BatchID: batch,
+		}
+	}
+
+	runner := NewRunner([]Job{mkJob("a.bin", 1)})
+
+	var (
+		mu     sync.Mutex
+		events []Event
+		done   = make(chan error, 1)
+	)
+	go func() {
+		done <- runner.Run(t.Context(), func(e Event) {
+			mu.Lock()
+			events = append(events, e)
+			mu.Unlock()
+		})
+	}()
+
+	// Append batch 2 while batch 1 is blocked in Resolve. Start index should
+	// be 1 (one job already in the slice).
+	if got := runner.Append(mkJob("b.bin", 2), mkJob("c.bin", 2)); got != 1 {
+		t.Errorf("Append start index = %d, want 1", got)
+	}
+	close(gate)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var doneEvents []Event
+	for _, e := range events {
+		if e.Kind == EventDone {
+			doneEvents = append(doneEvents, e)
+		}
+	}
+	if len(doneEvents) != 3 {
+		t.Fatalf("EventDone count = %d, want 3", len(doneEvents))
+	}
+
+	// First job is batch 1; the appended pair is batch 2.
+	wantBatches := []int{1, 2, 2}
+	for i, ev := range doneEvents {
+		if ev.BatchID != wantBatches[i] {
+			t.Errorf("doneEvents[%d].BatchID = %d, want %d", i, ev.BatchID, wantBatches[i])
+		}
+	}
+	// Final Total must reflect the post-append size.
+	if got := doneEvents[len(doneEvents)-1].Total; got != 3 {
+		t.Errorf("final Total = %d, want 3", got)
 	}
 }
 

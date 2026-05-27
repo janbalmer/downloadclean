@@ -50,19 +50,21 @@ func loadAccountsCmd(accountsPath string, insecure bool) tea.Cmd {
 	}
 }
 
-// runQueue launches queue.Run on its own goroutine and returns the channels
-// the model needs to drain. The events channel is closed before the error
-// is sent on done, so a waitForEvent that observes a closed channel knows
-// the terminal event will arrive via waitForDone.
+// runQueue launches Runner.Run on its own goroutine and returns the runner
+// (for mid-run Append) and the channels the model needs to drain. The
+// events channel is closed before the error is sent on done, so a
+// waitForEvent that observes a closed channel knows the terminal event
+// will arrive via waitForDone.
 func runQueue(parent context.Context, jobs []queue.Job) (
-	context.Context, context.CancelFunc, <-chan queue.Event, <-chan error,
+	*queue.Runner, context.CancelFunc, <-chan queue.Event, <-chan error,
 ) {
 	ctx, cancel := context.WithCancel(parent)
 	events := make(chan queue.Event, 64)
 	done := make(chan error, 1)
+	runner := queue.NewRunner(jobs)
 
 	go func() {
-		err := queue.Run(ctx, jobs, func(e queue.Event) {
+		err := runner.Run(ctx, func(e queue.Event) {
 			events <- e
 		})
 		close(events)
@@ -70,7 +72,7 @@ func runQueue(parent context.Context, jobs []queue.Job) (
 		close(done)
 	}()
 
-	return ctx, cancel, events, done
+	return runner, cancel, events, done
 }
 
 // waitForEvent yields one event from the bridge. Returning nil on a closed

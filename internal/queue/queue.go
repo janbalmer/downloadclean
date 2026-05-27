@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/janbalmer/downloadclean/internal/dlc"
 	"github.com/janbalmer/downloadclean/internal/downloader"
@@ -20,10 +21,14 @@ type Job struct {
 	// Link is the DLC entry to download.
 	Link dlc.Link
 	// Hoster resolves Link.URL to a direct download URL. A nil Hoster
-	// causes [Run] to emit [EventSkipped] for this job.
+	// causes the queue to emit [EventSkipped] for this job.
 	Hoster hoster.Hoster
 	// OutDir is the directory the final file is written into.
 	OutDir string
+	// BatchID identifies the group this job belongs to, letting front-ends
+	// render multiple .dlc files queued in one session as distinct batches.
+	// Zero is a valid value for callers that don't care.
+	BatchID int
 }
 
 // EventKind describes the type of an [Event].
@@ -69,7 +74,8 @@ func (k EventKind) String() string {
 type Event struct {
 	Kind        EventKind
 	Index       int // 0-based index within the supplied job slice
-	Total       int // total number of jobs
+	Total       int // total number of jobs (grows if more are appended)
+	BatchID     int // mirrors Job.BatchID for the emitting job
 	Link        dlc.Link
 	Hoster      string // hoster name, e.g. "rapidgator" (empty for EventSkipped due to no hoster)
 	Filename    string // populated once known
@@ -95,22 +101,67 @@ func (e *ErrCollision) Error() string {
 // EventFn receives queue events. Implementations should be cheap.
 type EventFn func(Event)
 
-// Run executes jobs in order on the caller's goroutine. A failure in one job
-// is reported as EventFailed and execution continues with the next job,
-// unless ctx is canceled (in which case Run returns ctx.Err() without
-// emitting a failure event for the cancelled job). Sequential execution is
-// intentional — do not introduce fan-out here.
-func Run(ctx context.Context, jobs []Job, on EventFn) error {
+// Runner executes a growable job list sequentially. Append may be called
+// from another goroutine while Run is executing; appended jobs are picked
+// up by subsequent loop iterations. Sequential execution is intentional —
+// do not introduce fan-out here.
+type Runner struct {
+	mu   sync.Mutex
+	jobs []Job
+}
+
+// NewRunner returns a Runner pre-seeded with the given initial jobs.
+func NewRunner(initial []Job) *Runner {
+	r := &Runner{}
+	if len(initial) > 0 {
+		r.jobs = append(r.jobs, initial...)
+	}
+	return r
+}
+
+// Append adds jobs to the queue and returns the index at which the first
+// new job was placed. Safe to call concurrently with Run; if the loop has
+// already drained the slice and returned, the appended jobs are simply
+// left behind (the caller is responsible for noticing).
+func (r *Runner) Append(jobs ...Job) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	start := len(r.jobs)
+	r.jobs = append(r.jobs, jobs...)
+	return start
+}
+
+// Run executes jobs in order on the caller's goroutine. A failure in one
+// job is reported as EventFailed and execution continues with the next
+// job, unless ctx is canceled (in which case Run returns ctx.Err() without
+// emitting a failure event for the cancelled job).
+func (r *Runner) Run(ctx context.Context, on EventFn) error {
 	emit := func(e Event) {
 		if on != nil {
 			on(e)
 		}
 	}
-	for i, job := range jobs {
+	for i := 0; ; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		base := Event{Index: i, Total: len(jobs), Link: job.Link, SizeBytes: -1}
+
+		r.mu.Lock()
+		if i >= len(r.jobs) {
+			r.mu.Unlock()
+			return nil
+		}
+		job := r.jobs[i]
+		total := len(r.jobs)
+		r.mu.Unlock()
+
+		base := Event{
+			Index:     i,
+			Total:     total,
+			BatchID:   job.BatchID,
+			Link:      job.Link,
+			SizeBytes: -1,
+		}
 
 		if job.Hoster == nil {
 			ev := base
@@ -209,7 +260,12 @@ func Run(ctx context.Context, jobs []Job, on EventFn) error {
 		evDone.SizeBytes = size
 		emit(evDone)
 	}
-	return nil
+}
+
+// Run is a one-shot helper that executes a static job slice. It exists for
+// callers (like the CLI) that don't need to append jobs mid-run.
+func Run(ctx context.Context, jobs []Job, on EventFn) error {
+	return NewRunner(jobs).Run(ctx, on)
 }
 
 func eventWith(base Event, kind EventKind, desc string) Event {

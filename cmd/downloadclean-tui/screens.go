@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -23,10 +25,6 @@ import (
 // header line (1) + table header row (1) + table border line (1).
 const rowsOffsetY = 6
 
-// ledgerCap is the maximum number of recent rows the downloading screen
-// keeps in its scrollback strip.
-const ledgerCap = 12
-
 // displayName returns the user-facing name for a link, matching what the
 // parsed-list table shows so the downloading screen stays consistent. The
 // queue tracks the hoster-rewritten filename on disk; the UI uses the dlc-
@@ -38,40 +36,76 @@ func displayName(link dlc.Link) string {
 	return link.URL
 }
 
-// glyphFor returns the cyberpunk glyph for a ledger entry kind.
-func glyphFor(k ledgerKind) string {
-	switch k {
-	case ledgerDone:
-		return "✓"
-	case ledgerSkipped, ledgerCollision:
-		return "⊘"
-	case ledgerFailed:
-		return "✗"
+// batchByJobIndex returns the batch that owns the queue job at idx, or nil
+// if no batch covers that index (shouldn't happen in practice — every
+// running job was placed by startBatch or appendBatch).
+func (m *model) batchByJobIndex(idx int) *batchInfo {
+	for i := len(m.batches) - 1; i >= 0; i-- {
+		if idx >= m.batches[i].startIdx {
+			return &m.batches[i]
+		}
 	}
-	return " "
+	return nil
 }
 
-// styleFor returns the theme style appropriate for a ledger entry's glyph.
-func (m model) styleFor(k ledgerKind) lipgloss.Style {
-	switch k {
-	case ledgerDone:
-		return m.theme.Success
-	case ledgerSkipped, ledgerCollision:
-		return m.theme.Skip
-	case ledgerFailed:
-		return m.theme.Error
+// batchStatus categorises a batch for the status column on the downloading
+// screen. A batch is "active" while it has at least one started-but-not-
+// finished job, "done" when every job has reached a terminal kind, and
+// "queued" before any of its jobs starts.
+func (m *model) batchStatus(b *batchInfo) string {
+	if b.finished() >= b.count && b.count > 0 {
+		return "done"
 	}
-	return m.theme.Muted
+	if b.id == m.active.batchID {
+		return "active"
+	}
+	if b.finished() > 0 {
+		// Some jobs already finished but a different batch is active — this
+		// can only happen if every job in this batch was skipped without an
+		// EventStarted, which still counts as completed.
+		return "done"
+	}
+	return "queued"
 }
 
 // updatePicker handles input on the file-picker screen. The textinput
 // captures printable runes (paths can contain q/a/n/spaces) so we only
-// intercept the structural keys: Enter to submit, Esc/Ctrl+C to exit.
+// intercept the structural keys: Enter to submit, Esc/Ctrl+C to exit. When
+// addMode is set, Esc returns to the downloading screen instead of quitting
+// and a successful parse will append to the running queue.
 func updatePicker(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "esc":
+		case "ctrl+c":
+			if m.addMode {
+				// Cancel both the add flow and the running queue, mirroring
+				// the downloading screen's quit behavior.
+				if m.cancel != nil {
+					m.cancel()
+					m.cancel = nil
+				}
+				m.addMode = false
+				m.addSourcePath = ""
+				m.parsing = false
+				m.links = nil
+				m.selected = nil
+				m.pathInput.Reset()
+				m.screen = screenDownloading
+				return m, nil
+			}
+			return m, tea.Quit
+		case "esc":
+			if m.addMode {
+				m.addMode = false
+				m.addSourcePath = ""
+				m.parsing = false
+				m.links = nil
+				m.selected = nil
+				m.pathInput.Reset()
+				m.screen = screenDownloading
+				return m, nil
+			}
 			return m, tea.Quit
 		case "enter":
 			raw := m.pathInput.Value()
@@ -82,6 +116,7 @@ func updatePicker(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.err = nil
 			m.parsing = true
+			m.addSourcePath = path
 			return m, tea.Batch(parseDLCCmd(path), m.parseSpinner.Tick)
 		}
 		var cmd tea.Cmd
@@ -99,6 +134,9 @@ func updatePicker(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.selected = make([]bool, len(msg.Links))
 		for i := range m.selected {
 			m.selected[i] = true
+		}
+		if msg.Path != "" {
+			m.addSourcePath = msg.Path
 		}
 		m.table = buildLinkTable(m, m.innerWidth()-4)
 		m.screen = screenParsed
@@ -149,14 +187,43 @@ func viewPicker(m model) string {
 	return body
 }
 
-// updateParsed handles input on the link-selection screen.
+// updateParsed handles input on the link-selection screen. When addMode is
+// set, Back returns to the downloading screen (without disturbing the
+// running queue) and Enter appends the selection as a new batch instead of
+// starting a fresh download.
 func updateParsed(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch {
 		case key.Matches(msg, m.keys.Quit):
+			if m.addMode {
+				// Ctrl+C / q during the add flow cancels both the add and
+				// the queue itself, matching the downloading screen.
+				if m.cancel != nil {
+					m.cancel()
+					m.cancel = nil
+				}
+				m.addMode = false
+				m.addSourcePath = ""
+				m.links = nil
+				m.selected = nil
+				m.pathInput.Reset()
+				m.parseBanner = ""
+				m.screen = screenDownloading
+				return m, nil
+			}
 			return m, tea.Quit
 		case key.Matches(msg, m.keys.Back):
+			if m.addMode {
+				m.addMode = false
+				m.addSourcePath = ""
+				m.links = nil
+				m.selected = nil
+				m.pathInput.Reset()
+				m.parseBanner = ""
+				m.screen = screenDownloading
+				return m, nil
+			}
 			m.screen = screenPicker
 			m.links = nil
 			m.selected = nil
@@ -184,10 +251,19 @@ func updateParsed(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case key.Matches(msg, m.keys.Enter):
 			if !anySelected(m.selected) {
-				m.parseBanner = "select at least one link to start"
+				if m.addMode {
+					m.parseBanner = "select at least one link to queue"
+				} else {
+					m.parseBanner = "select at least one link to start"
+				}
 				return m, nil
 			}
 			m.parseBanner = ""
+			if m.addMode {
+				// Registry/accounts were already loaded for the initial
+				// batch; reuse them for the appended batch.
+				return appendBatch(m)
+			}
 			return m, loadAccountsCmd(m.flags.accountsPath, m.flags.insecure)
 		}
 		var cmd tea.Cmd
@@ -259,6 +335,21 @@ func viewParsed(m model) string {
 func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if key.Matches(msg, m.keys.AddDLC) {
+			// Drop into the picker screen in add mode. The queue keeps
+			// running in its goroutine; the event channel keeps draining
+			// because waitForEvent re-arms itself after every message.
+			m.addMode = true
+			m.addReturnTo = screenDownloading
+			m.err = nil
+			m.parseBanner = ""
+			m.pathInput.Reset()
+			m.pathInput.Focus()
+			m.links = nil
+			m.selected = nil
+			m.screen = screenPicker
+			return m, tea.Batch(textinput.Blink, m.parseSpinner.Tick)
+		}
 		if key.Matches(msg, m.keys.Quit) {
 			if m.cancel != nil {
 				m.cancel()
@@ -266,25 +357,6 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
-
-	case queueEventMsg:
-		cmds := []tea.Cmd{waitForEvent(m.events)}
-		if cmd := applyQueueEvent(&m, msg.Ev); cmd != nil {
-			cmds = append(cmds, cmd)
-		}
-		return m, tea.Batch(cmds...)
-
-	case queueDoneMsg:
-		if errors.Is(msg.Err, context.Canceled) {
-			m.cancelled = true
-		}
-		m.summaryErr = msg.Err
-		m.screen = screenSummary
-		m.cancel = nil
-		return m, nil
-
-	case tickMsg:
-		return m, tickCmd()
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -301,8 +373,10 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// viewDownloading renders the active job header, the two progress bars,
-// the speed/ETA line, and the recent-completions strip.
+// viewDownloading renders the active job panel on top and the batches
+// table below. The active panel shows the currently downloading file with
+// progress / speed / ETA; the batches table tracks every queued .dlc with
+// its source, first file, file count, and per-batch status.
 func viewDownloading(m model) string {
 	th := m.theme
 
@@ -370,33 +444,82 @@ func viewDownloading(m model) string {
 	)
 	activePanel := th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left, activeRows...))
 
-	recentHeader := th.Subtitle.Render("recent:")
-	var rows []string
-	start := 0
-	if len(m.ledger) > ledgerCap {
-		start = len(m.ledger) - ledgerCap
-	}
-	for _, e := range m.ledger[start:] {
-		glyph := m.styleFor(e.kind).Render(glyphFor(e.kind))
-		sizeNote := ""
-		if e.sizeBytes > 0 {
-			sizeNote = humanSize(e.sizeBytes)
-		}
-		note := th.Muted.Render(e.note)
-		name := e.filename
-		if name == "" {
-			name = th.Muted.Render("(no filename)")
-		}
-		rows = append(rows, fmt.Sprintf("%s  %s  %s  %s",
-			glyph, name, th.Muted.Render(sizeNote), note))
-	}
+	batchesHeader := th.Subtitle.Render("batches:")
+	batchesTable := renderBatchesTable(&m)
 
-	cancelHint := th.Muted.Render("q / ctrl+c: cancel · keeps .part for resume")
+	cancelHint := th.Muted.Render("a: add dlc · q / ctrl+c: cancel · keeps .part for resume")
 
-	parts := []string{activePanel, "", recentHeader}
-	parts = append(parts, rows...)
-	parts = append(parts, "", cancelHint)
+	parts := []string{activePanel, "", batchesHeader, batchesTable, "", cancelHint}
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// renderBatchesTable lays out the per-batch status table on the downloading
+// screen. Columns: #, source (.dlc filename), first file, files, status.
+func renderBatchesTable(m *model) string {
+	th := m.theme
+	if len(m.batches) == 0 {
+		return th.Muted.Render("(no batches)")
+	}
+
+	const (
+		idW     = 3
+		filesW  = 6
+		statusW = 9
+	)
+	avail := m.innerWidth() - idW - filesW - statusW - 8 // spacing between columns
+	if avail < 20 {
+		avail = 20
+	}
+	sourceW := avail / 2
+	if sourceW < 12 {
+		sourceW = 12
+	}
+	firstW := avail - sourceW
+	if firstW < 12 {
+		firstW = 12
+	}
+
+	headerCells := []string{
+		padRight("#", idW),
+		padRight("source", sourceW),
+		padRight("first file", firstW),
+		padRight("files", filesW),
+		padRight("status", statusW),
+	}
+	headerLine := th.TableHeader.Render(strings.Join(headerCells, "  "))
+
+	rows := []string{headerLine}
+	for i := range m.batches {
+		b := &m.batches[i]
+		status := m.batchStatus(b)
+		statusStyle := th.Muted
+		switch status {
+		case "active":
+			statusStyle = th.Accent
+		case "done":
+			statusStyle = th.Success
+		}
+		filesText := fmt.Sprintf("%d/%d", b.finished(), b.count)
+		cells := []string{
+			padRight(fmt.Sprintf("%d", b.id), idW),
+			padRight(truncate(b.source, sourceW), sourceW),
+			padRight(truncate(b.firstFile, firstW), firstW),
+			padRight(filesText, filesW),
+			padRight(statusStyle.Render(status), statusW),
+		}
+		rows = append(rows, strings.Join(cells, "  "))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, rows...)
+}
+
+// padRight pads s with trailing spaces until its visible width is w. ANSI
+// escapes from lipgloss styling are ignored — lipgloss.Width strips them.
+func padRight(s string, w int) string {
+	visible := lipgloss.Width(s)
+	if visible >= w {
+		return s
+	}
+	return s + strings.Repeat(" ", w-visible)
 }
 
 // updateSummary handles input on the summary screen.
@@ -471,8 +594,14 @@ func viewSummary(m model) string {
 }
 
 // startBatch builds the job slice from the current selection, spins up the
-// queue goroutine via runQueue, and transitions to the downloading screen.
+// queue goroutine via runQueue, registers it as batch 1, and transitions to
+// the downloading screen. When called with m.jobs already populated (rerun
+// of failed), it reuses those jobs and labels them batch 1 too.
 func startBatch(m model) (tea.Model, tea.Cmd) {
+	m.nextBatchID = 1
+	source := batchSourceLabel(m.flags.initialDLC)
+	var firstFile string
+
 	if len(m.jobs) == 0 {
 		jobs := make([]queue.Job, 0, len(m.links))
 		for i, link := range m.links {
@@ -481,23 +610,43 @@ func startBatch(m model) (tea.Model, tea.Cmd) {
 			}
 			h := m.registry.Find(link.URL)
 			jobs = append(jobs, queue.Job{
-				Link:   link,
-				Hoster: h,
-				OutDir: m.flags.outputDir,
+				Link:    link,
+				Hoster:  h,
+				OutDir:  m.flags.outputDir,
+				BatchID: m.nextBatchID,
 			})
+			if firstFile == "" {
+				firstFile = displayName(link)
+			}
 		}
 		m.jobs = jobs
+	} else {
+		for i := range m.jobs {
+			m.jobs[i].BatchID = m.nextBatchID
+		}
+		firstFile = displayName(m.jobs[0].Link)
+		source = "rerun"
 	}
 	if len(m.jobs) == 0 {
 		m.parseBanner = "nothing to download"
 		return m, nil
 	}
 
-	_, cancel, events, errs := runQueue(context.Background(), m.jobs)
+	m.batches = []batchInfo{{
+		id:        m.nextBatchID,
+		source:    source,
+		firstFile: firstFile,
+		count:     len(m.jobs),
+		startIdx:  0,
+	}}
+	m.nextBatchID++
+
+	runner, cancel, events, errs := runQueue(context.Background(), m.jobs)
+	m.runner = runner
 	m.cancel = cancel
 	m.events = events
 	m.errs = errs
-	m.active = activeJob{total: len(m.jobs)}
+	m.active = activeJob{total: len(m.jobs), batchID: m.batches[0].id}
 	m.screen = screenDownloading
 
 	resetFile := m.progressFile.SetPercent(0)
@@ -512,6 +661,75 @@ func startBatch(m model) (tea.Model, tea.Cmd) {
 	)
 }
 
+// appendBatch turns the current selection into queue.Jobs, appends them to
+// the running Runner as a new batch, and returns to the downloading screen.
+// Called when the user confirms link selection during the add-DLC flow.
+func appendBatch(m model) (tea.Model, tea.Cmd) {
+	jobs := make([]queue.Job, 0, len(m.links))
+	var firstFile string
+	for i, link := range m.links {
+		if !m.selected[i] {
+			continue
+		}
+		h := m.registry.Find(link.URL)
+		jobs = append(jobs, queue.Job{
+			Link:    link,
+			Hoster:  h,
+			OutDir:  m.flags.outputDir,
+			BatchID: m.nextBatchID,
+		})
+		if firstFile == "" {
+			firstFile = displayName(link)
+		}
+	}
+	if len(jobs) == 0 {
+		m.parseBanner = "select at least one link to queue"
+		return m, nil
+	}
+	if m.runner == nil {
+		// Defensive: should never happen because the add flow is only
+		// reachable from screenDownloading.
+		m.parseBanner = "no active queue to append to"
+		return m, nil
+	}
+
+	startIdx := m.runner.Append(jobs...)
+	m.jobs = append(m.jobs, jobs...)
+	m.batches = append(m.batches, batchInfo{
+		id:        m.nextBatchID,
+		source:    batchSourceLabel(m.addSourcePath),
+		firstFile: firstFile,
+		count:     len(jobs),
+		startIdx:  startIdx,
+	})
+	m.nextBatchID++
+
+	m.addMode = false
+	m.addSourcePath = ""
+	m.parseBanner = ""
+	m.links = nil
+	m.selected = nil
+	m.pathInput.Reset()
+	m.screen = screenDownloading
+	return m, nil
+}
+
+// batchSourceLabel returns a short label for a .dlc file path, used as the
+// "source" column in the batches table. Empty paths fall back to a generic
+// label so the table still has something to show.
+func batchSourceLabel(p string) string {
+	if p == "" {
+		return "selection"
+	}
+	// Trim any directory portion so the table stays narrow.
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' || p[i] == '\\' {
+			return p[i+1:]
+		}
+	}
+	return p
+}
+
 // applyQueueEvent folds one queue event into the model. It returns any
 // progress command the caller should batch into the next tea.Cmd.
 func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
@@ -519,6 +737,7 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 	case queue.EventStarted:
 		m.active.index = ev.Index
 		m.active.total = ev.Total
+		m.active.batchID = ev.BatchID
 		m.active.hosterName = ev.Hoster
 		m.active.filename = displayName(ev.Link)
 		m.active.destPath = ""
@@ -563,49 +782,34 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 		return nil
 
 	case queue.EventDone:
-		m.ledger = append(m.ledger, ledgerEntry{
-			kind:      ledgerDone,
-			filename:  displayName(ev.Link),
-			sizeBytes: ev.SizeBytes,
-			note:      "done",
-		})
+		if b := m.batchByJobIndex(ev.Index); b != nil {
+			b.done++
+		}
 		m.done++
+		// Total may have grown if a new batch was appended; keep the active
+		// figure in sync so the bottom progress bar reflects current totals.
+		m.active.total = ev.Total
 		return m.progressBatch.SetPercent(m.batchPct())
 
 	case queue.EventFailed:
-		note := "failed"
-		if ev.Err != nil {
-			note = ev.Err.Error()
+		if b := m.batchByJobIndex(ev.Index); b != nil {
+			b.failed++
 		}
-		m.ledger = append(m.ledger, ledgerEntry{
-			kind:      ledgerFailed,
-			filename:  displayName(ev.Link),
-			sizeBytes: ev.SizeBytes,
-			note:      note,
-		})
 		m.failed++
 		m.failedJobs = append(m.failedJobs, queue.Job{
 			Link:   ev.Link,
 			Hoster: m.registry.Find(ev.Link.URL),
 			OutDir: m.flags.outputDir,
 		})
+		m.active.total = ev.Total
 		return m.progressBatch.SetPercent(m.batchPct())
 
 	case queue.EventSkipped:
-		kind := ledgerSkipped
-		note := ev.Description
-		var coll *queue.ErrCollision
-		if errors.As(ev.Err, &coll) {
-			kind = ledgerCollision
-			note = "exists (collision)"
+		if b := m.batchByJobIndex(ev.Index); b != nil {
+			b.skipped++
 		}
-		m.ledger = append(m.ledger, ledgerEntry{
-			kind:      kind,
-			filename:  displayName(ev.Link),
-			sizeBytes: ev.SizeBytes,
-			note:      note,
-		})
 		m.skipped++
+		m.active.total = ev.Total
 		return m.progressBatch.SetPercent(m.batchPct())
 	}
 	return nil

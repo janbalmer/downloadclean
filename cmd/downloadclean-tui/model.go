@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -44,6 +45,7 @@ type flags struct {
 type activeJob struct {
 	index          int
 	total          int
+	batchID        int
 	hosterName     string
 	filename       string
 	destPath       string
@@ -54,24 +56,22 @@ type activeJob struct {
 	smoothedSpeed  float64
 }
 
-// ledgerKind categorises a completed job for glyph and colour selection.
-type ledgerKind int
-
-const (
-	ledgerDone ledgerKind = iota
-	ledgerFailed
-	ledgerSkipped
-	ledgerCollision
-)
-
-// ledgerEntry is one row in the recent-completions strip on the downloading
-// and summary screens.
-type ledgerEntry struct {
-	kind      ledgerKind
-	filename  string
-	sizeBytes int64
-	note      string
+// batchInfo is one row in the batches table on the downloading screen. The
+// batches slice on the model is kept in BatchID order (id == index+1) so the
+// table renders newest at the bottom.
+type batchInfo struct {
+	id        int    // 1-based, matches queue.Job.BatchID
+	source    string // basename of the .dlc file (or "selection" for pasted paths)
+	firstFile string // displayName(links[0]) — the first file in this batch
+	count     int    // jobs added from this batch
+	done      int
+	failed    int
+	skipped   int
+	startIdx  int // queue index of the batch's first job (from Runner.Append)
 }
+
+// finished reports whether every job in the batch has reached a terminal kind.
+func (b batchInfo) finished() int { return b.done + b.failed + b.skipped }
 
 // keyMap is the source of truth for every key binding the TUI reacts to,
 // plus their help text. Methods on it satisfy the help.KeyMap interface;
@@ -88,6 +88,7 @@ type keyMap struct {
 	SelectNone key.Binding
 	Back       key.Binding
 	Rerun      key.Binding
+	AddDLC     key.Binding
 
 	activeScreen screen
 }
@@ -105,6 +106,7 @@ func newKeyMap() keyMap {
 		SelectNone: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "select none")),
 		Back:       key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
 		Rerun:      key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rerun failed")),
+		AddDLC:     key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add dlc")),
 	}
 }
 
@@ -116,7 +118,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 	case screenParsed:
 		return []key.Binding{k.Up, k.Down, k.Toggle, k.SelectAll, k.SelectNone, k.Enter, k.Back, k.Help, k.Quit}
 	case screenDownloading:
-		return []key.Binding{k.Quit, k.Help}
+		return []key.Binding{k.AddDLC, k.Quit, k.Help}
 	case screenSummary:
 		return []key.Binding{k.Rerun, k.Back, k.Quit, k.Help}
 	}
@@ -128,7 +130,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Up, k.Down, k.Enter, k.Back},
 		{k.Toggle, k.SelectAll, k.SelectNone},
-		{k.Rerun, k.Help, k.Quit},
+		{k.AddDLC, k.Rerun, k.Help, k.Quit},
 	}
 }
 
@@ -156,6 +158,7 @@ type model struct {
 
 	jobs          []queue.Job
 	failedJobs    []queue.Job
+	runner        *queue.Runner
 	events        <-chan queue.Event
 	errs          <-chan error
 	cancel        context.CancelFunc
@@ -163,7 +166,11 @@ type model struct {
 	progressBatch progress.Model
 	downSpinner   spinner.Model
 	active        activeJob
-	ledger        []ledgerEntry
+	batches       []batchInfo
+	nextBatchID   int
+	addMode       bool   // user is adding a .dlc on top of an in-flight queue
+	addReturnTo   screen // screen to return to after add flow completes/cancels
+	addSourcePath string // path of the .dlc being parsed in add mode
 	done          int
 	failed        int
 	skipped       int
@@ -277,6 +284,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.help.ShowAll = !m.help.ShowAll
 			return m, nil
 		}
+
+	// queueEventMsg / queueDoneMsg can arrive while the user is in the
+	// add-DLC sub-flow (picker or parsed selection table). Always apply
+	// them and keep the event channel draining, regardless of screen.
+	case queueEventMsg:
+		cmds := []tea.Cmd{waitForEvent(m.events)}
+		if cmd := applyQueueEvent(&m, msg.Ev); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+	case queueDoneMsg:
+		if errors.Is(msg.Err, context.Canceled) {
+			m.cancelled = true
+		}
+		m.summaryErr = msg.Err
+		// Tear down the add-DLC flow if it was still open; either way, the
+		// download session is over.
+		m.addMode = false
+		m.addSourcePath = ""
+		m.links = nil
+		m.selected = nil
+		m.pathInput.Reset()
+		m.parseBanner = ""
+		m.screen = screenSummary
+		m.cancel = nil
+		return m, nil
+
+	// Keep the 500ms refresh tick alive across screen transitions so
+	// speed/ETA stay current if the user briefly visits the add picker.
+	case tickMsg:
+		if m.runner != nil && m.cancel != nil {
+			return m, tickCmd()
+		}
+		return m, nil
 	}
 
 	switch m.screen {
@@ -342,10 +383,12 @@ func (m model) innerWidth() int {
 	return w
 }
 
-// resetBatchState clears per-batch counters and the ledger so the
+// resetBatchState clears per-batch counters and the batches table so the
 // downloading screen starts fresh on a rerun.
 func (m *model) resetBatchState() {
-	m.ledger = m.ledger[:0]
+	m.batches = nil
+	m.nextBatchID = 0
+	m.runner = nil
 	m.done = 0
 	m.failed = 0
 	m.skipped = 0
@@ -354,6 +397,7 @@ func (m *model) resetBatchState() {
 	m.active = activeJob{}
 	m.err = nil
 	m.summaryErr = nil
+	m.addMode = false
 }
 
 // humanSize formats a byte count in 1024-base units, mirroring the CLI.
