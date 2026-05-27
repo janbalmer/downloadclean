@@ -33,7 +33,9 @@ func TestParse_RoundTrip(t *testing.T) {
 	)
 
 	derivedKey := []byte("0123456789ABCDEF") // exactly 16 bytes
-	body := encryptCBC(t, derivedKey, derivedKey, []byte(plaintextXML))
+	// DLC body = base64(AES-CBC(derivedKey, derivedKey, base64(xml)))
+	innerB64 := base64.StdEncoding.EncodeToString([]byte(plaintextXML))
+	body := encryptCBC(t, derivedKey, derivedKey, []byte(innerB64))
 	bodyB64 := base64.StdEncoding.EncodeToString(body)
 
 	// rc = AES-CBC(firstPassKey, firstPassIV, derivedKey) — derivedKey is one
@@ -48,7 +50,8 @@ func TestParse_RoundTrip(t *testing.T) {
 		if got := r.URL.Query().Get("data"); got != keyBlob {
 			t.Errorf("service: unexpected data param: got %q want %q", got, keyBlob)
 		}
-		fmt.Fprintf(w, "<dlc><rc>%s</rc></dlc>", rcB64)
+		// AppWork's live service returns a bare <rc>…</rc> root element.
+		fmt.Fprintf(w, "<rc>%s</rc>", rcB64)
 	}))
 	defer srv.Close()
 
@@ -95,6 +98,35 @@ func TestParse_TooShort(t *testing.T) {
 	_, err := p.Parse(bytes.NewReader([]byte("short")))
 	if err == nil {
 		t.Fatal("expected error, got nil")
+	}
+}
+
+func TestExtractRC(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		err  bool
+	}{
+		{`<rc>iO6aeouMEDemy1tCeJsVwA==</rc>`, "iO6aeouMEDemy1tCeJsVwA==", false},
+		{`<dlc><rc>abc==</rc></dlc>`, "abc==", false},
+		{`<wrap><rc>  spaced  </rc></wrap>`, "spaced", false},
+		{`<rc></rc>`, "", true},
+		{`<no-rc-here/>`, "", true},
+	}
+	for _, c := range cases {
+		got, err := extractRC([]byte(c.in))
+		if c.err {
+			if err == nil {
+				t.Errorf("extractRC(%q): expected error, got %q", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("extractRC(%q): unexpected error: %v", c.in, err)
+		}
+		if got != c.want {
+			t.Errorf("extractRC(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 

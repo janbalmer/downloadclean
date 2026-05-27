@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -94,7 +95,14 @@ func (p *Parser) Parse(r io.Reader) ([]Link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dlc body decrypt: %w", err)
 	}
-	return parseXML(plaintext)
+	// AES output is itself base64-encoded XML; trim trailing nulls/whitespace
+	// because the DLC body uses zero padding, not PKCS#7.
+	plaintext = bytes.TrimRight(plaintext, "\x00 \t\r\n")
+	xmlBytes, err := base64.StdEncoding.DecodeString(string(plaintext))
+	if err != nil {
+		return nil, fmt.Errorf("dlc body inner base64: %w", err)
+	}
+	return parseXML(xmlBytes)
 }
 
 // fetchKey calls the dlcrypt service with the 88-byte key blob and returns
@@ -114,17 +122,12 @@ func (p *Parser) fetchKey(keyBlob string) ([]byte, error) {
 		return nil, fmt.Errorf("dlc service: read: %w", err)
 	}
 
-	var env struct {
-		RC string `xml:"rc"`
-	}
-	if err := xml.Unmarshal(xmlBody, &env); err != nil {
-		return nil, fmt.Errorf("dlc service: parse: %w", err)
-	}
-	if env.RC == "" {
-		return nil, fmt.Errorf("dlc service: empty <rc> (response: %q)", truncate(string(xmlBody), 200))
+	rcText, err := extractRC(xmlBody)
+	if err != nil {
+		return nil, fmt.Errorf("dlc service: %w (response: %q)", err, truncate(string(xmlBody), 200))
 	}
 
-	rc, err := base64.StdEncoding.DecodeString(env.RC)
+	rc, err := base64.StdEncoding.DecodeString(rcText)
 	if err != nil {
 		return nil, fmt.Errorf("dlc service <rc> base64: %w", err)
 	}
@@ -136,6 +139,34 @@ func (p *Parser) fetchKey(keyBlob string) ([]byte, error) {
 		return nil, fmt.Errorf("dlc service <rc>: derived key too short (%d bytes)", len(derived))
 	}
 	return derived[:16], nil
+}
+
+// extractRC finds the first <rc> element in xmlBody and returns its text.
+// Tolerates either a bare <rc>...</rc> root or any wrapper around it.
+func extractRC(xmlBody []byte) (string, error) {
+	dec := xml.NewDecoder(bytes.NewReader(xmlBody))
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			return "", fmt.Errorf("no <rc> element found")
+		}
+		if err != nil {
+			return "", fmt.Errorf("parse: %w", err)
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != "rc" {
+			continue
+		}
+		var text string
+		if err := dec.DecodeElement(&text, &se); err != nil {
+			return "", fmt.Errorf("decode <rc>: %w", err)
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return "", fmt.Errorf("empty <rc>")
+		}
+		return text, nil
+	}
 }
 
 func aesCBCDecrypt(key, iv, ciphertext []byte) ([]byte, error) {

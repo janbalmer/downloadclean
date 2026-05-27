@@ -27,25 +27,19 @@ func main() {
 
 func run() error {
 	var (
-		accountsPath  = flag.String("accounts", config.DefaultPath(), "path to accounts.json")
-		dlcPath       = flag.String("dlc", "", "path to .dlc file (required)")
-		outDir        = flag.String("output", config.DefaultOutputDir(), "directory to download into")
-		verbose       = flag.Bool("verbose", false, "extra logging")
-		insecure      = flag.Bool("insecure-config", false, "skip the file-permission check on accounts.json")
+		accountsPath = flag.String("accounts", config.DefaultPath(), "path to accounts.json")
+		dlcPath      = flag.String("dlc", "", "path to .dlc file (required)")
+		outDir       = flag.String("output", config.DefaultOutputDir(), "directory to download into")
+		verbose      = flag.Bool("verbose", false, "extra logging")
+		insecure     = flag.Bool("insecure-config", false, "skip the file-permission check on accounts.json")
+		list         = flag.Bool("list", false, "decrypt and print links, do not download")
+		limit        = flag.Int("limit", 0, "download at most this many links (0 = all)")
 	)
 	flag.Parse()
 
 	if *dlcPath == "" {
 		flag.Usage()
 		return fmt.Errorf("--dlc is required")
-	}
-
-	accs, err := config.Load(*accountsPath, *insecure)
-	if err != nil {
-		return err
-	}
-	if *verbose {
-		fmt.Fprintf(os.Stderr, "loaded accounts from %s\n", *accountsPath)
 	}
 
 	dlcFile, err := os.Open(*dlcPath)
@@ -64,9 +58,29 @@ func run() error {
 	}
 	fmt.Fprintf(os.Stderr, "%d link(s) parsed from %s\n", len(links), *dlcPath)
 
+	if *list {
+		for i, l := range links {
+			fmt.Printf("%d\t%s\t%s\t%d\t%s\n", i+1, l.URL, l.Name, l.Size, l.Package)
+		}
+		return nil
+	}
+
+	accs, err := config.Load(*accountsPath, *insecure)
+	if err != nil {
+		return err
+	}
+	if *verbose {
+		fmt.Fprintf(os.Stderr, "loaded accounts from %s\n", *accountsPath)
+	}
+
 	reg := hoster.NewRegistry()
 	if accs.Rapidgator != nil && accs.Rapidgator.Login != "" {
 		reg.Register(rapidgator.New(accs.Rapidgator.Login, accs.Rapidgator.Password))
+	}
+
+	if *limit > 0 && *limit < len(links) {
+		fmt.Fprintf(os.Stderr, "limit: taking first %d of %d link(s)\n", *limit, len(links))
+		links = links[:*limit]
 	}
 
 	jobs := make([]queue.Job, 0, len(links))
