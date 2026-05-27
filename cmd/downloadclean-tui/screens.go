@@ -1,0 +1,707 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/table"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/janbalmer/downloadclean/internal/dlc"
+	"github.com/janbalmer/downloadclean/internal/queue"
+)
+
+// rowsOffsetY is the vertical offset, inside the inner frame body, at
+// which the parsed-screen table's first data row appears. It accounts for
+// the outer frame title (1) + subtitle (1) + blank (1) + parsed-screen
+// header line (1) + table header row (1) + table border line (1).
+const rowsOffsetY = 6
+
+// ledgerCap is the maximum number of recent rows the downloading screen
+// keeps in its scrollback strip.
+const ledgerCap = 12
+
+// displayName returns the user-facing name for a link, matching what the
+// parsed-list table shows so the downloading screen stays consistent. The
+// queue tracks the hoster-rewritten filename on disk; the UI uses the dlc-
+// declared name.
+func displayName(link dlc.Link) string {
+	if link.Name != "" {
+		return link.Name
+	}
+	return link.URL
+}
+
+// glyphFor returns the cyberpunk glyph for a ledger entry kind.
+func glyphFor(k ledgerKind) string {
+	switch k {
+	case ledgerDone:
+		return "✓"
+	case ledgerSkipped, ledgerCollision:
+		return "⊘"
+	case ledgerFailed:
+		return "✗"
+	}
+	return " "
+}
+
+// styleFor returns the theme style appropriate for a ledger entry's glyph.
+func (m model) styleFor(k ledgerKind) lipgloss.Style {
+	switch k {
+	case ledgerDone:
+		return m.theme.Success
+	case ledgerSkipped, ledgerCollision:
+		return m.theme.Skip
+	case ledgerFailed:
+		return m.theme.Error
+	}
+	return m.theme.Muted
+}
+
+// updatePicker handles input on the file-picker screen. The textinput
+// captures printable runes (paths can contain q/a/n/spaces) so we only
+// intercept the structural keys: Enter to submit, Esc/Ctrl+C to exit.
+func updatePicker(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "esc":
+			return m, tea.Quit
+		case "enter":
+			raw := m.pathInput.Value()
+			path := normalizeDroppedPath(raw)
+			if path == "" {
+				m.err = errors.New("no path given")
+				return m, nil
+			}
+			m.err = nil
+			m.parsing = true
+			return m, tea.Batch(parseDLCCmd(path), m.parseSpinner.Tick)
+		}
+		var cmd tea.Cmd
+		m.pathInput, cmd = m.pathInput.Update(msg)
+		return m, cmd
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.parseSpinner, cmd = m.parseSpinner.Update(msg)
+		return m, cmd
+
+	case dlcParsedMsg:
+		m.parsing = false
+		m.links = msg.Links
+		m.selected = make([]bool, len(msg.Links))
+		for i := range m.selected {
+			m.selected[i] = true
+		}
+		m.table = buildLinkTable(m, m.innerWidth()-4)
+		m.screen = screenParsed
+		return m, nil
+
+	case dlcParseErrMsg:
+		m.parsing = false
+		m.err = msg.Err
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.pathInput, cmd = m.pathInput.Update(msg)
+	return m, cmd
+}
+
+// viewPicker renders the centred file path prompt and any banner.
+func viewPicker(m model) string {
+	hint := m.theme.Accent.Render("▶ ") +
+		m.theme.Subtitle.Render("drop a .dlc file here or type a path…")
+
+	inputBox := m.theme.Input.Render(m.pathInput.View())
+
+	spin := ""
+	if m.parsing {
+		spin = m.parseSpinner.View() + " " +
+			m.theme.Muted.Render("decrypting…")
+	}
+
+	banner := ""
+	if m.err != nil {
+		banner = m.theme.Banner.
+			Foreground(lipgloss.Color(HexErrorRed)).
+			Render(m.err.Error())
+	}
+
+	stack := lipgloss.JoinVertical(lipgloss.Left,
+		hint,
+		"",
+		inputBox,
+		spin,
+	)
+
+	body := lipgloss.Place(m.innerWidth(), 0, lipgloss.Center, lipgloss.Top, stack)
+	if banner != "" {
+		body = lipgloss.JoinVertical(lipgloss.Left, body, "", banner)
+	}
+	return body
+}
+
+// updateParsed handles input on the link-selection screen.
+func updateParsed(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch {
+		case key.Matches(msg, m.keys.Quit):
+			return m, tea.Quit
+		case key.Matches(msg, m.keys.Back):
+			m.screen = screenPicker
+			m.links = nil
+			m.selected = nil
+			m.parseBanner = ""
+			m.pathInput.Reset()
+			return m, nil
+		case key.Matches(msg, m.keys.Toggle):
+			c := m.table.Cursor()
+			if c >= 0 && c < len(m.selected) {
+				m.selected[c] = !m.selected[c]
+				m.table.SetRows(linkTableRows(m))
+			}
+			return m, nil
+		case key.Matches(msg, m.keys.SelectAll):
+			for i := range m.selected {
+				m.selected[i] = true
+			}
+			m.table.SetRows(linkTableRows(m))
+			return m, nil
+		case key.Matches(msg, m.keys.SelectNone):
+			for i := range m.selected {
+				m.selected[i] = false
+			}
+			m.table.SetRows(linkTableRows(m))
+			return m, nil
+		case key.Matches(msg, m.keys.Enter):
+			if !anySelected(m.selected) {
+				m.parseBanner = "select at least one link to start"
+				return m, nil
+			}
+			m.parseBanner = ""
+			return m, loadAccountsCmd(m.flags.accountsPath, m.flags.insecure)
+		}
+		var cmd tea.Cmd
+		m.table, cmd = m.table.Update(msg)
+		return m, cmd
+
+	case tea.MouseMsg:
+		if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+			rowIdx := msg.Y - rowsOffsetY
+			if rowIdx >= 0 && rowIdx < len(m.selected) {
+				m.table.SetCursor(rowIdx)
+				m.selected[rowIdx] = !m.selected[rowIdx]
+				m.table.SetRows(linkTableRows(m))
+			}
+		}
+		return m, nil
+
+	case accountsLoadedMsg:
+		m.accounts = msg.Accounts
+		m.registry = msg.Registry
+		return startBatch(m)
+
+	case accountsErrMsg:
+		m.parseBanner = msg.Err.Error()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.table, cmd = m.table.Update(msg)
+	return m, cmd
+}
+
+// viewParsed renders the link table and a stats header.
+func viewParsed(m model) string {
+	sel := 0
+	var totalBytes int64
+	for i, link := range m.links {
+		if m.selected[i] {
+			sel++
+			if link.Size > 0 {
+				totalBytes += link.Size
+			}
+		}
+	}
+
+	header := fmt.Sprintf("%d / %d selected · %s",
+		sel, len(m.links), humanSize(totalBytes))
+	headerStyled := m.theme.Subtitle.Render(header)
+
+	banner := ""
+	if m.parseBanner != "" {
+		banner = "\n" + m.theme.Banner.
+			Foreground(lipgloss.Color(HexErrorRed)).
+			Render(m.parseBanner)
+	}
+
+	footer := m.theme.Muted.Render(
+		"space toggle · a all · n none · enter download · esc back")
+
+	return lipgloss.JoinVertical(lipgloss.Left,
+		headerStyled,
+		m.table.View(),
+		footer,
+		banner,
+	)
+}
+
+// updateDownloading handles input and events while the queue runs.
+func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if key.Matches(msg, m.keys.Quit) {
+			if m.cancel != nil {
+				m.cancel()
+				m.cancel = nil
+			}
+			return m, nil
+		}
+
+	case queueEventMsg:
+		cmds := []tea.Cmd{waitForEvent(m.events)}
+		if cmd := applyQueueEvent(&m, msg.Ev); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
+
+	case queueDoneMsg:
+		if errors.Is(msg.Err, context.Canceled) {
+			m.cancelled = true
+		}
+		m.summaryErr = msg.Err
+		m.screen = screenSummary
+		m.cancel = nil
+		return m, nil
+
+	case tickMsg:
+		return m, tickCmd()
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.downSpinner, cmd = m.downSpinner.Update(msg)
+		return m, cmd
+
+	case progress.FrameMsg:
+		pmFile, cmdF := m.progressFile.Update(msg)
+		m.progressFile = pmFile.(progress.Model)
+		pmBatch, cmdB := m.progressBatch.Update(msg)
+		m.progressBatch = pmBatch.(progress.Model)
+		return m, tea.Batch(cmdF, cmdB)
+	}
+	return m, nil
+}
+
+// viewDownloading renders the active job header, the two progress bars,
+// the speed/ETA line, and the recent-completions strip.
+func viewDownloading(m model) string {
+	th := m.theme
+
+	header := fmt.Sprintf("%s [%d/%d]  %s  %s",
+		m.downSpinner.View(),
+		m.active.index+1, m.active.total,
+		th.Accent.Render(m.active.hosterName),
+		m.active.filename,
+	)
+
+	pct := 0.0
+	if m.active.sizeBytes > 0 {
+		pct = float64(m.active.downloaded) / float64(m.active.sizeBytes)
+		if pct > 1 {
+			pct = 1
+		}
+	}
+	pctLabel := th.ProgressLabel.Render(fmt.Sprintf("%5.1f%%", pct*100))
+
+	speedText := "--"
+	etaText := "--"
+	if m.active.smoothedSpeed > 0 {
+		speedText = humanSize(int64(m.active.smoothedSpeed)) + "/s"
+		if m.active.sizeBytes > 0 && m.active.downloaded < m.active.sizeBytes {
+			remaining := float64(m.active.sizeBytes-m.active.downloaded) / m.active.smoothedSpeed
+			etaText = formatDuration(time.Duration(remaining * float64(time.Second)))
+		}
+	}
+
+	sizeText := ""
+	if m.active.sizeBytes > 0 {
+		sizeText = fmt.Sprintf("%s / %s",
+			humanSize(m.active.downloaded), humanSize(m.active.sizeBytes))
+	} else if m.active.downloaded > 0 {
+		sizeText = humanSize(m.active.downloaded)
+	} else {
+		sizeText = th.Muted.Render("waiting…")
+	}
+
+	stats := fmt.Sprintf("%s  •  %s  •  ETA %s",
+		sizeText,
+		th.Accent.Render(speedText),
+		th.KeyHint.Render(etaText),
+	)
+
+	finished := m.done + m.failed + m.skipped
+	batchLabel := th.ProgressLabel.Render(
+		fmt.Sprintf("[%d/%d completed]", finished, m.active.total))
+
+	activePanel := th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left,
+		header,
+		"",
+		m.progressFile.View()+"  "+pctLabel,
+		stats,
+		"",
+		m.progressBatch.View()+"  "+batchLabel,
+	))
+
+	recentHeader := th.Subtitle.Render("recent:")
+	var rows []string
+	start := 0
+	if len(m.ledger) > ledgerCap {
+		start = len(m.ledger) - ledgerCap
+	}
+	for _, e := range m.ledger[start:] {
+		glyph := m.styleFor(e.kind).Render(glyphFor(e.kind))
+		sizeNote := ""
+		if e.sizeBytes > 0 {
+			sizeNote = humanSize(e.sizeBytes)
+		}
+		note := th.Muted.Render(e.note)
+		name := e.filename
+		if name == "" {
+			name = th.Muted.Render("(no filename)")
+		}
+		rows = append(rows, fmt.Sprintf("%s  %s  %s  %s",
+			glyph, name, th.Muted.Render(sizeNote), note))
+	}
+
+	cancelHint := th.Muted.Render("q / ctrl+c: cancel · keeps .part for resume")
+
+	parts := []string{activePanel, "", recentHeader}
+	parts = append(parts, rows...)
+	parts = append(parts, "", cancelHint)
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// updateSummary handles input on the summary screen.
+func updateSummary(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch {
+		case key.Matches(msg, m.keys.Quit):
+			return m, tea.Quit
+		case key.Matches(msg, m.keys.Back):
+			m.screen = screenPicker
+			m.links = nil
+			m.selected = nil
+			m.registry = nil
+			m.accounts = nil
+			m.parseBanner = ""
+			m.pathInput.Reset()
+			m.resetBatchState()
+			return m, nil
+		case key.Matches(msg, m.keys.Rerun):
+			if len(m.failedJobs) == 0 {
+				return m, nil
+			}
+			retry := m.failedJobs
+			m.resetBatchState()
+			m.jobs = retry
+			return startBatch(m)
+		}
+	}
+	return m, nil
+}
+
+// viewSummary renders the centred completion banner.
+func viewSummary(m model) string {
+	th := m.theme
+
+	header := "COMPLETE"
+	headerStyle := th.Success
+	if m.cancelled {
+		header = "CANCELLED"
+		headerStyle = th.Skip
+	} else if m.failed > 0 {
+		headerStyle = th.Error
+	}
+
+	doneText := th.Success.Render(fmt.Sprintf("✓ %d done", m.done))
+	skipText := th.Skip.Render(fmt.Sprintf("⊘ %d skipped", m.skipped))
+	failText := th.Error.Render(fmt.Sprintf("✗ %d failed", m.failed))
+
+	counters := lipgloss.JoinHorizontal(lipgloss.Top,
+		doneText, "   ", skipText, "   ", failText)
+
+	hints := th.Muted.Render("q quit · r rerun failed · esc new dlc")
+
+	banner := th.Banner.Render(lipgloss.JoinVertical(lipgloss.Center,
+		headerStyle.Render(header),
+		"",
+		counters,
+		"",
+		hints,
+	))
+
+	if m.summaryErr != nil && !errors.Is(m.summaryErr, context.Canceled) {
+		banner = lipgloss.JoinVertical(lipgloss.Center,
+			banner,
+			"",
+			th.Muted.Render(m.summaryErr.Error()),
+		)
+	}
+
+	return lipgloss.Place(m.innerWidth(), 0, lipgloss.Center, lipgloss.Top, banner)
+}
+
+// startBatch builds the job slice from the current selection, spins up the
+// queue goroutine via runQueue, and transitions to the downloading screen.
+func startBatch(m model) (tea.Model, tea.Cmd) {
+	if len(m.jobs) == 0 {
+		jobs := make([]queue.Job, 0, len(m.links))
+		for i, link := range m.links {
+			if !m.selected[i] {
+				continue
+			}
+			h := m.registry.Find(link.URL)
+			jobs = append(jobs, queue.Job{
+				Link:   link,
+				Hoster: h,
+				OutDir: m.flags.outputDir,
+			})
+		}
+		m.jobs = jobs
+	}
+	if len(m.jobs) == 0 {
+		m.parseBanner = "nothing to download"
+		return m, nil
+	}
+
+	_, cancel, events, errs := runQueue(context.Background(), m.jobs)
+	m.cancel = cancel
+	m.events = events
+	m.errs = errs
+	m.active = activeJob{total: len(m.jobs)}
+	m.screen = screenDownloading
+
+	resetFile := m.progressFile.SetPercent(0)
+	resetBatch := m.progressBatch.SetPercent(0)
+	return m, tea.Batch(
+		waitForEvent(events),
+		waitForDone(errs),
+		m.downSpinner.Tick,
+		tickCmd(),
+		resetFile,
+		resetBatch,
+	)
+}
+
+// applyQueueEvent folds one queue event into the model. It returns any
+// progress command the caller should batch into the next tea.Cmd.
+func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
+	switch ev.Kind {
+	case queue.EventStarted:
+		m.active.index = ev.Index
+		m.active.total = ev.Total
+		m.active.hosterName = ev.Hoster
+		m.active.filename = displayName(ev.Link)
+		m.active.downloaded = 0
+		m.active.sizeBytes = -1
+		m.active.lastSampleAt = time.Time{}
+		m.active.lastSampleDown = 0
+		m.active.smoothedSpeed = 0
+		return m.progressFile.SetPercent(0)
+
+	case queue.EventResolved:
+		m.active.sizeBytes = ev.SizeBytes
+		return nil
+
+	case queue.EventProgress:
+		now := time.Now()
+		if !m.active.lastSampleAt.IsZero() {
+			dt := now.Sub(m.active.lastSampleAt).Seconds()
+			if dt > 0 {
+				inst := float64(ev.Downloaded-m.active.lastSampleDown) / dt
+				if inst < 0 {
+					inst = 0
+				}
+				if m.active.smoothedSpeed == 0 {
+					m.active.smoothedSpeed = inst
+				} else {
+					m.active.smoothedSpeed = 0.3*inst + 0.7*m.active.smoothedSpeed
+				}
+			}
+		}
+		m.active.lastSampleAt = now
+		m.active.lastSampleDown = ev.Downloaded
+		m.active.downloaded = ev.Downloaded
+		if ev.SizeBytes > 0 {
+			m.active.sizeBytes = ev.SizeBytes
+		}
+		if m.active.sizeBytes > 0 {
+			pct := float64(m.active.downloaded) / float64(m.active.sizeBytes)
+			return m.progressFile.SetPercent(pct)
+		}
+		return nil
+
+	case queue.EventDone:
+		m.ledger = append(m.ledger, ledgerEntry{
+			kind:      ledgerDone,
+			filename:  displayName(ev.Link),
+			sizeBytes: ev.SizeBytes,
+			note:      "done",
+		})
+		m.done++
+		return m.progressBatch.SetPercent(m.batchPct())
+
+	case queue.EventFailed:
+		note := "failed"
+		if ev.Err != nil {
+			note = ev.Err.Error()
+		}
+		m.ledger = append(m.ledger, ledgerEntry{
+			kind:      ledgerFailed,
+			filename:  displayName(ev.Link),
+			sizeBytes: ev.SizeBytes,
+			note:      note,
+		})
+		m.failed++
+		m.failedJobs = append(m.failedJobs, queue.Job{
+			Link:   ev.Link,
+			Hoster: m.registry.Find(ev.Link.URL),
+			OutDir: m.flags.outputDir,
+		})
+		return m.progressBatch.SetPercent(m.batchPct())
+
+	case queue.EventSkipped:
+		kind := ledgerSkipped
+		note := ev.Description
+		var coll *queue.ErrCollision
+		if errors.As(ev.Err, &coll) {
+			kind = ledgerCollision
+			note = "exists (collision)"
+		}
+		m.ledger = append(m.ledger, ledgerEntry{
+			kind:      kind,
+			filename:  displayName(ev.Link),
+			sizeBytes: ev.SizeBytes,
+			note:      note,
+		})
+		m.skipped++
+		return m.progressBatch.SetPercent(m.batchPct())
+	}
+	return nil
+}
+
+// batchPct returns the fraction of finished (any terminal kind) jobs.
+func (m *model) batchPct() float64 {
+	if m.active.total == 0 {
+		return 0
+	}
+	finished := m.done + m.failed + m.skipped
+	return float64(finished) / float64(m.active.total)
+}
+
+// buildLinkTable constructs the parsed-screen table with the configured
+// column widths sized to the available terminal width.
+func buildLinkTable(m model, width int) table.Model {
+	width = max(width, 60)
+	checkW := 3
+	idxW := 4
+	sizeW := 10
+	hosterW := 12
+	pkgW := 14
+	nameW := width - checkW - idxW - sizeW - hosterW - pkgW - 6
+	if nameW < 10 {
+		nameW = 10
+	}
+
+	cols := []table.Column{
+		{Title: " ", Width: checkW},
+		{Title: "#", Width: idxW},
+		{Title: "filename", Width: nameW},
+		{Title: "size", Width: sizeW},
+		{Title: "hoster", Width: hosterW},
+		{Title: "package", Width: pkgW},
+	}
+
+	t := table.New(
+		table.WithColumns(cols),
+		table.WithFocused(true),
+		table.WithHeight(maxInt(m.height-12, 6)),
+	)
+	st := table.DefaultStyles()
+	st.Header = m.theme.TableHeader
+	st.Cell = m.theme.TableRow
+	st.Selected = m.theme.TableSelected
+	t.SetStyles(st)
+	t.SetRows(linkTableRows(m))
+	return t
+}
+
+// linkTableRows builds the table rows from the current links and selection
+// mask, picking a checkbox glyph and a truncated filename per row.
+func linkTableRows(m model) []table.Row {
+	rows := make([]table.Row, len(m.links))
+	for i, link := range m.links {
+		glyph := "◻"
+		if m.selected[i] {
+			glyph = "◼"
+		}
+		name := displayName(link)
+		size := ""
+		if link.Size > 0 {
+			size = humanSize(link.Size)
+		}
+		hosterName := ""
+		if m.registry != nil {
+			if h := m.registry.Find(link.URL); h != nil {
+				hosterName = h.Name()
+			}
+		}
+		if hosterName == "" {
+			hosterName = m.theme.Muted.Render("—")
+		}
+		rows[i] = table.Row{
+			glyph,
+			fmt.Sprintf("%d", i+1),
+			truncate(name, 60),
+			size,
+			hosterName,
+			truncate(link.Package, 14),
+		}
+	}
+	return rows
+}
+
+// anySelected reports whether the selection mask has at least one true entry.
+func anySelected(sel []bool) bool {
+	for _, s := range sel {
+		if s {
+			return true
+		}
+	}
+	return false
+}
+
+// truncate clips s to n runes, appending an ellipsis if it was shortened.
+func truncate(s string, n int) string {
+	if n <= 0 || len(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n < 2 {
+		return string(r[:n])
+	}
+	return string(r[:n-1]) + "…"
+}

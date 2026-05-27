@@ -3,13 +3,14 @@
 ## What this project is
 
 A JDownloader-style sequential link downloader in Go. Reads a `.dlc`, resolves
-each link via a hoster account, downloads files one at a time. v1 is CLI;
-a Bubble Tea TUI is planned but not yet started.
+each link via a hoster account, downloads files one at a time. Two front-ends:
+a plain CLI and a Bubble Tea TUI; both wrap the same `internal/` packages.
 
 ## Architecture
 
 ```
-cmd/downloadclean/        CLI entry point (v1). TUI will live in a sibling cmd/.
+cmd/downloadclean/        CLI entry point. Prints to stdout, exit 1 on failure.
+cmd/downloadclean-tui/    Bubble Tea TUI. Cyberpunk palette + drag-drop picker.
 internal/config/          accounts.json loader + XDG path resolution.
 internal/dlc/             .dlc decryption + XML parsing.
 internal/hoster/          Hoster interface + Registry.
@@ -18,14 +19,23 @@ internal/downloader/      Streaming HTTP GET with Range resume + progress.
 internal/queue/           Sequential Job runner emitting events.
 ```
 
-The split exists so that the TUI command can reuse every `internal/` package
-without restructuring. New hosters are one file under `internal/hoster/<name>/`.
+The split exists so both front-ends reuse every `internal/` package without
+restructuring. New hosters are one file under `internal/hoster/<name>/`.
+
+The TUI bridges the synchronous `queue.Run` to Bubble Tea by spawning a
+goroutine that publishes `queue.Event` values onto a buffered channel; a
+self-rearming `tea.Cmd` (`waitForEvent`) reads one event per cycle and
+delivers it as `queueEventMsg`. Cancellation flows through the context
+stored on the model — `Ctrl+C` / `q` on the downloading screen calls
+`m.cancel()` and waits for `queueDoneMsg` rather than quitting Bubble Tea
+directly, so `.part` files remain on disk for resume.
 
 ## Hard constraints
 
-- **No third-party deps in v1.** Everything is `crypto/aes`, `encoding/*`,
-  `net/http`, etc. The Charm Bracelet libs (`bubbletea`, `bubbles`, `lipgloss`)
-  come in only when the TUI command is added.
+- **`internal/` stays dependency-free.** Only `cmd/downloadclean-tui/`
+  imports the Charm libs (`bubbletea`, `bubbles`, `lipgloss`). The CLI and
+  every `internal/` package use stdlib only. New code in `internal/` must
+  not pull in third-party deps.
 - **Sequential downloads only.** The `queue` package is intentionally serial.
   Do not introduce goroutine fan-out without a design discussion.
 - **Premium-only Rapidgator.** Free-tier (captcha, wait timers) is explicitly
@@ -78,6 +88,6 @@ this hook, and end users can swap in a mirror if AppWork's service is down.
 
 ## Deferred (don't build unprompted)
 
-Bubble Tea TUI, parallel downloads, retry/backoff, bandwidth caps, free-tier
-flows, RSDF/CCF, persistent queue, additional hosters. These are roadmap
-items, not lurking work.
+Parallel downloads, retry/backoff, bandwidth caps, free-tier flows, RSDF/CCF,
+persistent queue, additional hosters. These are roadmap items, not lurking
+work.
