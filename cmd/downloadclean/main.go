@@ -30,7 +30,6 @@ func run() error {
 		accountsPath = flag.String("accounts", config.DefaultPath(), "path to accounts.json")
 		dlcPath      = flag.String("dlc", "", "path to .dlc file (required)")
 		outDir       = flag.String("output", config.DefaultOutputDir(), "directory to download into")
-		verbose      = flag.Bool("verbose", false, "extra logging")
 		insecure     = flag.Bool("insecure-config", false, "skip the file-permission check on accounts.json")
 		list         = flag.Bool("list", false, "decrypt and print links, do not download")
 		limit        = flag.Int("limit", 0, "download at most this many links (0 = all)")
@@ -69,9 +68,6 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	if *verbose {
-		fmt.Fprintf(os.Stderr, "loaded accounts from %s\n", *accountsPath)
-	}
 
 	reg := hoster.NewRegistry()
 	if accs.Rapidgator != nil && accs.Rapidgator.Login != "" {
@@ -92,7 +88,7 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	printer := newPrinter(*verbose)
+	printer := newPrinter()
 	if err := queue.Run(ctx, jobs, printer.handle); err != nil {
 		return err
 	}
@@ -104,15 +100,14 @@ func run() error {
 }
 
 type printer struct {
-	verbose bool
 	done    int
 	failed  int
 	skipped int
 	lastLen int
 }
 
-func newPrinter(verbose bool) *printer {
-	return &printer{verbose: verbose}
+func newPrinter() *printer {
+	return &printer{}
 }
 
 func (p *printer) clearLine() {
@@ -159,7 +154,7 @@ func (p *printer) summary() {
 
 func progressBar(done, total int64) string {
 	if total <= 0 {
-		return fmt.Sprintf("%s", humanSize(done))
+		return humanSize(done)
 	}
 	pct := float64(done) / float64(total) * 100
 	return fmt.Sprintf("%.1f%% (%s / %s)", pct, humanSize(done), humanSize(total))

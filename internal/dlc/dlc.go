@@ -20,6 +20,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,13 +51,19 @@ type Parser struct {
 	ServiceURL string
 	// HTTPClient overrides the default client used to call the service.
 	HTTPClient *http.Client
+
+	defaultOnce   sync.Once
+	defaultClient *http.Client
 }
 
 func (p *Parser) client() *http.Client {
 	if p.HTTPClient != nil {
 		return p.HTTPClient
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	p.defaultOnce.Do(func() {
+		p.defaultClient = &http.Client{Timeout: 30 * time.Second}
+	})
+	return p.defaultClient
 }
 
 func (p *Parser) serviceURL() string {

@@ -31,8 +31,10 @@ without restructuring. New hosters are one file under `internal/hoster/<name>/`.
 - **Premium-only Rapidgator.** Free-tier (captcha, wait timers) is explicitly
   out of scope for now.
 - **The repo is public on GitHub.** `accounts.json` is gitignored and the
-  config loader refuses world/group-readable credential files by default —
-  preserve both safeguards.
+  config loader (on Unix) refuses symlinked credential files, world/group-
+  readable credential files, and world/group-writable parent directories.
+  All three checks can be bypassed with `--insecure-config`. Preserve every
+  one of these safeguards.
 
 ## DLC decryption notes
 
@@ -61,9 +63,18 @@ this hook, and end users can swap in a mirror if AppWork's service is down.
 - Library packages return errors with package-prefixed context
   (`fmt.Errorf("rapidgator: download: %w", err)`).
 - The downloader writes to `<dest>.part` and renames on success; never leave
-  a half-written file at the final path.
+  a half-written file at the final path. A stale `.part` is the intended
+  resume mechanism — do not auto-delete it on cancellation.
 - Filename sanitization in `queue` strips path separators — keep that, a
-  hostile hoster response should not escape `--output`.
+  hostile hoster response should not escape `--output`. Cross-platform
+  hardening (Windows reserved names, control chars, length cap) is a
+  Phase 2 deliverable; until then, `sanitize` is intentionally minimal.
+- The queue refuses to overwrite an existing destination file: a colliding
+  job emits `EventSkipped` with `Err = *queue.ErrCollision{Path: dest}`.
+  The TUI uses `errors.As` to detect this and offer overwrite/rename.
+- Hoster-specific URL quirks (e.g. Rapidgator's `.html` page suffix) live
+  inside the hoster package, not in `queue`. `queue.basenameFromURL` is
+  hoster-agnostic; each hoster's `Resolve` cleans its own filename.
 
 ## Deferred (don't build unprompted)
 

@@ -1,3 +1,5 @@
+// Package config loads accounts.json from XDG paths and verifies
+// credential-file permissions on Unix.
 package config
 
 import (
@@ -6,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 type Accounts struct {
@@ -18,18 +21,40 @@ type RapidgatorAccount struct {
 }
 
 // Load reads and parses an accounts JSON file. If allowInsecure is false,
-// the file must not be group- or world-readable on Unix.
+// the file must not be a symlink, and on Unix it must not be group- or
+// world-readable and its parent directory must not be group- or
+// world-writable.
 func Load(path string, allowInsecure bool) (*Accounts, error) {
-	info, err := os.Stat(path)
+	// Lstat (not Stat) so a 0600 symlink pointing at a 0644 file doesn't
+	// pass the permission check.
+	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("accounts file: %w", err)
 	}
 	if !allowInsecure {
-		if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		if info.Mode()&os.ModeSymlink != 0 {
 			return nil, fmt.Errorf(
-				"accounts file %s has permissions %#o (group/world readable); "+
-					"run `chmod 600 %s` or pass --insecure-config",
-				path, mode, path)
+				"accounts file %s is a symlink; refusing to load credentials "+
+					"through a symlink (pass --insecure-config to override)", path)
+		}
+		if runtime.GOOS != "windows" {
+			if mode := info.Mode().Perm(); mode&0o077 != 0 {
+				return nil, fmt.Errorf(
+					"accounts file %s has permissions %#o (group/world readable); "+
+						"run `chmod 600 %s` or pass --insecure-config",
+					path, mode, path)
+			}
+			dirPath := filepath.Dir(path)
+			dirInfo, derr := os.Stat(dirPath)
+			if derr != nil {
+				return nil, fmt.Errorf("accounts dir: %w", derr)
+			}
+			if dmode := dirInfo.Mode().Perm(); dmode&0o022 != 0 {
+				return nil, fmt.Errorf(
+					"accounts file directory %s has permissions %#o (group/world writable); "+
+						"`chmod go-w %s` or pass --insecure-config",
+					dirPath, dmode, dirPath)
+			}
 		}
 	}
 	b, err := os.ReadFile(path)

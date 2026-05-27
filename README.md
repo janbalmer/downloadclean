@@ -38,8 +38,9 @@ Create `~/.config/downloadclean/accounts.json` (see `accounts.example.json`):
 { "rapidgator": { "login": "you@example.com", "password": "secret" } }
 ```
 
-The file must be `chmod 600`; otherwise the tool refuses to load it (override
-with `--insecure-config`).
+On Unix, the file must be `chmod 600`, must not be a symlink, and its parent
+directory must not be group- or world-writable. The tool refuses to load
+credentials otherwise (override with `--insecure-config`).
 
 ## Use
 
@@ -54,8 +55,9 @@ Flags:
 | `--dlc`              | (required) path to a `.dlc` file               |
 | `--accounts`         | `$XDG_CONFIG_HOME/downloadclean/accounts.json` |
 | `--output`           | `$XDG_DOWNLOAD_DIR` or `~/Downloads`           |
-| `--verbose`          | extra logging                                  |
-| `--insecure-config`  | skip the accounts-file permission check        |
+| `--list`             | decrypt and print links, do not download       |
+| `--limit`            | download at most N links (0 = all)             |
+| `--insecure-config`  | skip the accounts-file permission checks       |
 
 Set `DOWNLOADCLEAN_DLC_SERVICE` to override the dlcrypt endpoint if AppWork's
 default service is unreachable. The format string takes one `%s` placeholder

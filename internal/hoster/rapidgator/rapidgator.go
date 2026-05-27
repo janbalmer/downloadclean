@@ -9,8 +9,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +35,9 @@ type Client struct {
 
 	mu    sync.Mutex
 	token string
+
+	defaultOnce   sync.Once
+	defaultClient *http.Client
 }
 
 func New(login, password string) *Client {
@@ -59,6 +64,13 @@ func (c *Client) Resolve(ctx context.Context, link string) (hoster.Resolved, err
 		}
 		res, status, err := c.callDownload(ctx, fileID, tok)
 		if err == nil {
+			// Rapidgator's public URLs end in /<id>/<name>.html. If the API
+			// didn't return a filename, fall back to that basename minus the
+			// .html — keeping this here so the queue helper stays
+			// hoster-agnostic.
+			if res.Filename == "" {
+				res.Filename = basenameFromPublicURL(link)
+			}
 			return res, nil
 		}
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
@@ -68,6 +80,19 @@ func (c *Client) Resolve(ctx context.Context, link string) (hoster.Resolved, err
 		return hoster.Resolved{}, err
 	}
 	return hoster.Resolved{}, fmt.Errorf("rapidgator: download: auth retry exhausted")
+}
+
+func basenameFromPublicURL(link string) string {
+	u, err := url.Parse(link)
+	if err != nil {
+		return ""
+	}
+	b := path.Base(u.Path)
+	b = strings.TrimSuffix(b, ".html")
+	if b == "." || b == "/" || b == "" {
+		return ""
+	}
+	return b
 }
 
 // FileID extracts the file id from a rapidgator file URL.
@@ -91,7 +116,10 @@ func (c *Client) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
 	}
-	return &http.Client{Timeout: 30 * time.Second}
+	c.defaultOnce.Do(func() {
+		c.defaultClient = &http.Client{Timeout: 30 * time.Second}
+	})
+	return c.defaultClient
 }
 
 func (c *Client) clearToken() {

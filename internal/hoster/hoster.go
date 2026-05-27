@@ -23,6 +23,8 @@ type Hoster interface {
 }
 
 // Registry holds the set of hosters that the application knows about.
+// Register and Find are not safe for concurrent use: register all hosters
+// at startup before any goroutine calls Find.
 type Registry struct {
 	hosters []Hoster
 }

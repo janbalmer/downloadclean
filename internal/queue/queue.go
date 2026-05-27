@@ -3,7 +3,6 @@ package queue
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -41,12 +40,24 @@ type Event struct {
 	Index       int    // 0-based index within the supplied job slice
 	Total       int    // total number of jobs
 	Link        dlc.Link
+	Hoster      string // hoster name, e.g. "rapidgator" (empty for EventSkipped due to no hoster)
 	Filename    string // populated once known
 	Downloaded  int64
 	SizeBytes   int64 // -1 if unknown
 	DestPath    string
 	Err         error
 	Description string // human-readable note (skip reason, etc.)
+}
+
+// ErrCollision is set on Event.Err when a job is skipped because the
+// destination file already exists. Callers can use errors.As to detect
+// this case and offer the user an overwrite/rename prompt.
+type ErrCollision struct {
+	Path string
+}
+
+func (e *ErrCollision) Error() string {
+	return fmt.Sprintf("queue: destination exists: %s", e.Path)
 }
 
 // EventFn receives queue events. Implementations should be cheap.
@@ -73,6 +84,7 @@ func Run(ctx context.Context, jobs []Job, on EventFn) error {
 			emit(ev)
 			continue
 		}
+		base.Hoster = job.Hoster.Name()
 		emit(eventWith(base, EventStarted, ""))
 
 		resolved, err := job.Hoster.Resolve(ctx, job.Link.URL)
@@ -88,7 +100,7 @@ func Run(ctx context.Context, jobs []Job, on EventFn) error {
 		if filename == "" {
 			ev := base
 			ev.Kind = EventFailed
-			ev.Err = errors.New("could not determine filename")
+			ev.Err = fmt.Errorf("queue: pick filename: no candidate found")
 			emit(ev)
 			continue
 		}
@@ -105,6 +117,20 @@ func Run(ctx context.Context, jobs []Job, on EventFn) error {
 		evResolved.DestPath = dest
 		evResolved.SizeBytes = size
 		emit(evResolved)
+
+		// Refuse to overwrite an existing file at dest. Stale .part files are
+		// fine (the downloader will resume them); a complete dest means a
+		// previous run, or an earlier job in this batch, already produced it.
+		if _, statErr := os.Stat(dest); statErr == nil {
+			ev := base
+			ev.Kind = EventSkipped
+			ev.Filename = filename
+			ev.DestPath = dest
+			ev.Description = "destination file already exists"
+			ev.Err = &ErrCollision{Path: dest}
+			emit(ev)
+			continue
+		}
 
 		if err := os.MkdirAll(job.OutDir, 0o755); err != nil {
 			ev := base
@@ -180,7 +206,6 @@ func basenameFromURL(s string) string {
 	if b == "." || b == "/" || b == "" {
 		return ""
 	}
-	b = strings.TrimSuffix(b, ".html")
 	return b
 }
 
