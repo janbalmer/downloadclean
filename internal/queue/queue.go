@@ -108,6 +108,9 @@ type EventFn func(Event)
 type Runner struct {
 	mu   sync.Mutex
 	jobs []Job
+	// RateLimiter, if non-nil, throttles every Download in this run.
+	// Safe to mutate concurrently via its Set* methods.
+	RateLimiter *downloader.RateLimiter
 }
 
 // NewRunner returns a Runner pre-seeded with the given initial jobs.
@@ -239,7 +242,7 @@ func (r *Runner) Run(ctx context.Context, on EventFn) error {
 			ev.Downloaded = done
 			ev.SizeBytes = total
 			emit(ev)
-		}, downloader.Options{})
+		}, downloader.Options{RateLimiter: r.RateLimiter})
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()

@@ -16,6 +16,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/janbalmer/downloadclean/internal/dlc"
+	"github.com/janbalmer/downloadclean/internal/downloader"
 	"github.com/janbalmer/downloadclean/internal/queue"
 )
 
@@ -350,6 +351,32 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.screen = screenPicker
 			return m, tea.Batch(textinput.Blink, m.parseSpinner.Tick)
 		}
+		if key.Matches(msg, m.keys.RateToggle) {
+			m.rateLimiter.SetEnabled(!m.rateLimiter.Enabled())
+			return m, nil
+		}
+		if key.Matches(msg, m.keys.RateUp) {
+			if !m.rateLimiter.Enabled() {
+				m.rateLimiter.SetEnabled(true)
+			}
+			m.rateLimiter.SetBytesPerSec(m.rateLimiter.BytesPerSec() + 0.5*bytesPerMbit)
+			return m, nil
+		}
+		if key.Matches(msg, m.keys.RateDown) {
+			if !m.rateLimiter.Enabled() {
+				m.rateLimiter.SetEnabled(true)
+			}
+			next := m.rateLimiter.BytesPerSec() - 0.5*bytesPerMbit
+			if next < 0.5*bytesPerMbit {
+				next = 0.5 * bytesPerMbit
+			}
+			m.rateLimiter.SetBytesPerSec(next)
+			return m, nil
+		}
+		if msg.String() == "0" {
+			m.rateLimiter.SetEnabled(false)
+			return m, nil
+		}
 		if key.Matches(msg, m.keys.Quit) {
 			if m.cancel != nil {
 				m.cancel()
@@ -439,6 +466,7 @@ func viewDownloading(m model) string {
 		"",
 		m.progressFile.View()+"  "+pctLabel,
 		stats,
+		renderRateLimit(th, m.rateLimiter),
 		"",
 		m.progressBatch.View()+"  "+batchLabel,
 	)
@@ -447,10 +475,22 @@ func viewDownloading(m model) string {
 	batchesHeader := th.Subtitle.Render("batches:")
 	batchesTable := renderBatchesTable(&m)
 
-	cancelHint := th.Muted.Render("a: add dlc · q / ctrl+c: cancel · keeps .part for resume")
+	cancelHint := th.Muted.Render("a: add dlc · l: limit · +/-: rate · 0: off · q / ctrl+c: cancel")
 
 	parts := []string{activePanel, "", batchesHeader, batchesTable, "", cancelHint}
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// renderRateLimit returns the single-line "rate limit: …" indicator shown
+// inside the active panel. When the limiter is off the whole line is muted;
+// when it's on, the numeric cap is rendered in the accent color so a glance
+// at the panel reveals the current throttle.
+func renderRateLimit(th Theme, lim *downloader.RateLimiter) string {
+	if !lim.Enabled() {
+		return th.Muted.Render("rate limit: off")
+	}
+	mbit := lim.BytesPerSec() / bytesPerMbit
+	return th.Muted.Render("rate limit: ") + th.Accent.Render(fmt.Sprintf("%.1f Mbit/s", mbit))
 }
 
 // renderBatchesTable lays out the per-batch status table on the downloading
@@ -641,7 +681,7 @@ func startBatch(m model) (tea.Model, tea.Cmd) {
 	}}
 	m.nextBatchID++
 
-	runner, cancel, events, errs := runQueue(context.Background(), m.jobs)
+	runner, cancel, events, errs := runQueue(context.Background(), m.jobs, m.rateLimiter)
 	m.runner = runner
 	m.cancel = cancel
 	m.events = events

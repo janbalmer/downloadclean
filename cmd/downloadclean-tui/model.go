@@ -17,9 +17,15 @@ import (
 
 	"github.com/janbalmer/downloadclean/internal/config"
 	"github.com/janbalmer/downloadclean/internal/dlc"
+	"github.com/janbalmer/downloadclean/internal/downloader"
 	"github.com/janbalmer/downloadclean/internal/hoster"
 	"github.com/janbalmer/downloadclean/internal/queue"
 )
+
+// bytesPerMbit is the byte-per-second equivalent of one decimal megabit per
+// second. Used to translate the user-facing Mbit/s cap into the bytes-per-
+// second value the rate limiter expects.
+const bytesPerMbit = 125_000.0
 
 // screen identifies which page the model is showing.
 type screen int
@@ -89,6 +95,9 @@ type keyMap struct {
 	Back       key.Binding
 	Rerun      key.Binding
 	AddDLC     key.Binding
+	RateToggle key.Binding
+	RateUp     key.Binding
+	RateDown   key.Binding
 
 	activeScreen screen
 }
@@ -107,6 +116,9 @@ func newKeyMap() keyMap {
 		Back:       key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
 		Rerun:      key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rerun failed")),
 		AddDLC:     key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add dlc")),
+		RateToggle: key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "rate limit")),
+		RateUp:     key.NewBinding(key.WithKeys("+", "="), key.WithHelp("+", "+0.5 Mbit/s")),
+		RateDown:   key.NewBinding(key.WithKeys("-", "_"), key.WithHelp("-", "-0.5 Mbit/s")),
 	}
 }
 
@@ -118,7 +130,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 	case screenParsed:
 		return []key.Binding{k.Up, k.Down, k.Toggle, k.SelectAll, k.SelectNone, k.Enter, k.Back, k.Help, k.Quit}
 	case screenDownloading:
-		return []key.Binding{k.AddDLC, k.Quit, k.Help}
+		return []key.Binding{k.AddDLC, k.RateToggle, k.RateUp, k.RateDown, k.Quit, k.Help}
 	case screenSummary:
 		return []key.Binding{k.Rerun, k.Back, k.Quit, k.Help}
 	}
@@ -131,6 +143,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.Enter, k.Back},
 		{k.Toggle, k.SelectAll, k.SelectNone},
 		{k.AddDLC, k.Rerun, k.Help, k.Quit},
+		{k.RateToggle, k.RateUp, k.RateDown},
 	}
 }
 
@@ -178,6 +191,8 @@ type model struct {
 
 	summaryErr error
 
+	rateLimiter *downloader.RateLimiter
+
 	keys keyMap
 	help help.Model
 }
@@ -219,6 +234,9 @@ func newModel(f flags) model {
 		progress.WithWidth(50),
 	)
 
+	rl := downloader.NewRateLimiter()
+	rl.SetBytesPerSec(10.0 * bytesPerMbit)
+
 	h := help.New()
 	h.Styles.ShortKey = th.KeyHint
 	h.Styles.ShortDesc = th.Muted
@@ -237,6 +255,7 @@ func newModel(f flags) model {
 		downSpinner:   ds,
 		progressFile:  pf,
 		progressBatch: pb,
+		rateLimiter:   rl,
 		keys:          newKeyMap(),
 		help:          h,
 	}

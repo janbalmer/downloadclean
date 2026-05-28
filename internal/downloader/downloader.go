@@ -25,6 +25,8 @@ type Options struct {
 	HTTPClient *http.Client
 	// ProgressInterval throttles progress callbacks. Default: 100ms.
 	ProgressInterval time.Duration
+	// RateLimiter optionally throttles the byte stream. Nil = unlimited.
+	RateLimiter *RateLimiter
 }
 
 // Download streams url into dest using a .part suffix, renaming on success.
@@ -99,7 +101,14 @@ func Download(ctx context.Context, url, dest string, p ProgressFn, opts Options)
 		interval: opts.ProgressInterval,
 		last:     time.Now(),
 	}
-	if _, err := io.Copy(f, pr); err != nil {
+	// Throttling wraps the progress reader so the reported speed reflects
+	// on-disk throughput, not raw network bytes pulled before the limiter
+	// has had a chance to sleep.
+	var src io.Reader = pr
+	if opts.RateLimiter != nil {
+		src = &limitedReader{r: pr, lim: opts.RateLimiter, ctx: ctx}
+	}
+	if _, err := io.Copy(f, src); err != nil {
 		return fmt.Errorf("download: copy: %w", err)
 	}
 	if err := f.Close(); err != nil {

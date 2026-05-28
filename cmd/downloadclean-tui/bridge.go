@@ -10,6 +10,7 @@ import (
 
 	"github.com/janbalmer/downloadclean/internal/config"
 	"github.com/janbalmer/downloadclean/internal/dlc"
+	"github.com/janbalmer/downloadclean/internal/downloader"
 	"github.com/janbalmer/downloadclean/internal/hoster"
 	"github.com/janbalmer/downloadclean/internal/hoster/rapidgator"
 	"github.com/janbalmer/downloadclean/internal/queue"
@@ -54,14 +55,16 @@ func loadAccountsCmd(accountsPath string, insecure bool) tea.Cmd {
 // (for mid-run Append) and the channels the model needs to drain. The
 // events channel is closed before the error is sent on done, so a
 // waitForEvent that observes a closed channel knows the terminal event
-// will arrive via waitForDone.
-func runQueue(parent context.Context, jobs []queue.Job) (
+// will arrive via waitForDone. A non-nil limiter throttles every download
+// in the run; pass nil to disable throttling entirely.
+func runQueue(parent context.Context, jobs []queue.Job, limiter *downloader.RateLimiter) (
 	*queue.Runner, context.CancelFunc, <-chan queue.Event, <-chan error,
 ) {
 	ctx, cancel := context.WithCancel(parent)
 	events := make(chan queue.Event, 64)
 	done := make(chan error, 1)
 	runner := queue.NewRunner(jobs)
+	runner.RateLimiter = limiter
 
 	go func() {
 		err := runner.Run(ctx, func(e queue.Event) {
