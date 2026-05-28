@@ -3,142 +3,157 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 )
 
-const validJSON = `{"rapidgator":{"login":"alice","password":"hunter2"}}`
+const validConfigJSON = `{"archive_passwords":["alpha","bravo","charlie"]}`
 
-func writeAccountsFile(t *testing.T, dir, content string, fileMode, dirMode os.FileMode) string {
+func writeConfigFile(t *testing.T, dir, content string, fileMode, dirMode os.FileMode) string {
 	t.Helper()
-	if err := os.Chmod(dir, dirMode); err != nil {
+	return writeCredFile(t, dir, "config.json", content, fileMode, dirMode)
+}
+
+func TestLoadConfig_MissingFileReturnsEmpty(t *testing.T) {
+	skipOnWindows(t)
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatalf("chmod dir: %v", err)
 	}
-	path := filepath.Join(dir, "accounts.json")
-	if err := os.WriteFile(path, []byte(content), fileMode); err != nil {
-		t.Fatalf("write file: %v", err)
-	}
-	// WriteFile honors umask; force the requested mode.
-	if err := os.Chmod(path, fileMode); err != nil {
-		t.Fatalf("chmod file: %v", err)
-	}
-	return path
-}
+	path := filepath.Join(dir, "config.json")
 
-func skipOnWindows(t *testing.T) {
-	t.Helper()
-	if runtime.GOOS == "windows" {
-		t.Skip("Unix permission semantics not applicable on Windows")
-	}
-}
-
-func TestLoad_HappyPath(t *testing.T) {
-	skipOnWindows(t)
-	path := writeAccountsFile(t, t.TempDir(), validJSON, 0o600, 0o700)
-	a, err := Load(path, false)
+	cfg, err := LoadConfig(path, false)
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatalf("LoadConfig: %v", err)
 	}
-	if a.Rapidgator == nil || a.Rapidgator.Login != "alice" || a.Rapidgator.Password != "hunter2" {
-		t.Errorf("got %+v", a.Rapidgator)
+	if cfg == nil {
+		t.Fatal("LoadConfig returned nil *Config for missing file; want zero value")
+	}
+	if len(cfg.ArchivePasswords) != 0 {
+		t.Errorf("ArchivePasswords = %v, want empty", cfg.ArchivePasswords)
 	}
 }
 
-func TestLoad_SymlinkRefused(t *testing.T) {
+func TestLoadConfig_HappyPath(t *testing.T) {
+	skipOnWindows(t)
+	path := writeConfigFile(t, t.TempDir(), validConfigJSON, 0o600, 0o700)
+
+	cfg, err := LoadConfig(path, false)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	want := []string{"alpha", "bravo", "charlie"}
+	if len(cfg.ArchivePasswords) != len(want) {
+		t.Fatalf("ArchivePasswords = %v, want %v", cfg.ArchivePasswords, want)
+	}
+	for i, p := range want {
+		if cfg.ArchivePasswords[i] != p {
+			t.Errorf("ArchivePasswords[%d] = %q, want %q", i, cfg.ArchivePasswords[i], p)
+		}
+	}
+}
+
+func TestLoadConfig_EmptyJSONObject(t *testing.T) {
+	skipOnWindows(t)
+	path := writeConfigFile(t, t.TempDir(), `{}`, 0o600, 0o700)
+
+	cfg, err := LoadConfig(path, false)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(cfg.ArchivePasswords) != 0 {
+		t.Errorf("ArchivePasswords = %v, want empty", cfg.ArchivePasswords)
+	}
+}
+
+func TestLoadConfig_SymlinkRefused(t *testing.T) {
 	skipOnWindows(t)
 	realDir := t.TempDir()
 	linkDir := t.TempDir()
-	realPath := writeAccountsFile(t, realDir, validJSON, 0o600, 0o700)
-	linkPath := filepath.Join(linkDir, "accounts.json")
+	realPath := writeConfigFile(t, realDir, validConfigJSON, 0o600, 0o700)
+	if err := os.Chmod(linkDir, 0o700); err != nil {
+		t.Fatalf("chmod linkDir: %v", err)
+	}
+	linkPath := filepath.Join(linkDir, "config.json")
 	if err := os.Symlink(realPath, linkPath); err != nil {
 		t.Fatalf("symlink: %v", err)
 	}
 
-	if _, err := Load(linkPath, false); err == nil {
+	if _, err := LoadConfig(linkPath, false); err == nil {
 		t.Fatal("expected error, got nil")
 	} else if !strings.Contains(err.Error(), "symlink") {
 		t.Errorf("error should mention symlink: %v", err)
 	}
 
-	// --insecure-config bypasses the check.
-	if _, err := Load(linkPath, true); err != nil {
-		t.Errorf("insecure bypass failed: %v", err)
+	cfg, err := LoadConfig(linkPath, true)
+	if err != nil {
+		t.Fatalf("insecure bypass failed: %v", err)
+	}
+	if len(cfg.ArchivePasswords) != 3 {
+		t.Errorf("insecure bypass: ArchivePasswords = %v, want 3 entries", cfg.ArchivePasswords)
 	}
 }
 
-func TestLoad_WorldReadableRefused(t *testing.T) {
+func TestLoadConfig_WorldReadableRefused(t *testing.T) {
 	skipOnWindows(t)
 	for _, mode := range []os.FileMode{0o644, 0o640, 0o604} {
-		path := writeAccountsFile(t, t.TempDir(), validJSON, mode, 0o700)
-		if _, err := Load(path, false); err == nil {
+		dir := t.TempDir()
+		path := writeConfigFile(t, dir, validConfigJSON, mode, 0o700)
+		if _, err := LoadConfig(path, false); err == nil {
 			t.Errorf("mode %#o: expected error", mode)
 		} else if !strings.Contains(err.Error(), "chmod") {
 			t.Errorf("mode %#o: error should suggest chmod: %v", mode, err)
 		}
+		if _, err := LoadConfig(path, true); err != nil {
+			t.Errorf("mode %#o: insecure bypass failed: %v", mode, err)
+		}
 	}
 }
 
-func TestLoad_WorldWritableParentRefused(t *testing.T) {
+func TestLoadConfig_WorldWritableParentRefused(t *testing.T) {
 	skipOnWindows(t)
-	path := writeAccountsFile(t, t.TempDir(), validJSON, 0o600, 0o777)
-	if _, err := Load(path, false); err == nil {
+	path := writeConfigFile(t, t.TempDir(), validConfigJSON, 0o600, 0o777)
+
+	if _, err := LoadConfig(path, false); err == nil {
 		t.Fatal("expected error, got nil")
 	} else if !strings.Contains(err.Error(), "group/world writable") {
 		t.Errorf("error should mention writable directory: %v", err)
 	}
-}
-
-func TestLoad_InsecureBypassesAll(t *testing.T) {
-	skipOnWindows(t)
-	path := writeAccountsFile(t, t.TempDir(), validJSON, 0o644, 0o777)
-	if _, err := Load(path, true); err != nil {
-		t.Errorf("--insecure-config should bypass perm checks: %v", err)
+	if _, err := LoadConfig(path, true); err != nil {
+		t.Errorf("insecure bypass failed: %v", err)
 	}
 }
 
-func TestLoad_NonRegularFileRefused(t *testing.T) {
+func TestLoadConfig_MalformedJSON(t *testing.T) {
 	skipOnWindows(t)
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// Point Load at the directory itself, not a file inside it.
-	if _, err := Load(dir, false); err == nil {
-		t.Fatal("expected error loading a directory")
-	} else if !strings.Contains(err.Error(), "not a regular file") {
-		t.Errorf("error should mention regular file: %v", err)
-	}
-}
+	path := writeConfigFile(t, t.TempDir(), `not json`, 0o600, 0o700)
 
-func TestLoad_MalformedJSON(t *testing.T) {
-	skipOnWindows(t)
-	path := writeAccountsFile(t, t.TempDir(), `{"rapidgator": {`, 0o600, 0o700)
-	if _, err := Load(path, false); err == nil {
+	if _, err := LoadConfig(path, false); err == nil {
 		t.Fatal("expected parse error")
 	} else if !strings.Contains(err.Error(), "parse") {
 		t.Errorf("error should mention parse: %v", err)
 	}
 }
 
-func TestLoad_UnknownFieldRefused(t *testing.T) {
+func TestLoadConfig_UnknownFieldRefused(t *testing.T) {
 	skipOnWindows(t)
-	// A "rapidgater" typo (note the misspelling) used to silently disable the
-	// hoster — strict decoding makes it a parse error so the user can fix it.
-	path := writeAccountsFile(t, t.TempDir(), `{"rapidgater": {"login":"alice"}}`, 0o600, 0o700)
-	if _, err := Load(path, false); err == nil {
+	// Strict decoding catches typos (here: "archive_passwords" misspelled)
+	// rather than silently swallowing them and leaving the user wondering
+	// why their passwords aren't being tried.
+	path := writeConfigFile(t, t.TempDir(), `{"archive_password":["x"]}`, 0o600, 0o700)
+	if _, err := LoadConfig(path, false); err == nil {
 		t.Fatal("expected error for unknown field")
-	} else if !strings.Contains(err.Error(), "rapidgater") {
+	} else if !strings.Contains(err.Error(), "archive_password") {
 		t.Errorf("error should name the unknown field: %v", err)
 	}
 }
 
-func TestDefaultPath(t *testing.T) {
-	got := DefaultPath()
+func TestDefaultConfigPath(t *testing.T) {
+	got := DefaultConfigPath()
 	if got == "" {
-		t.Fatal("DefaultPath returned empty string")
+		t.Fatal("DefaultConfigPath returned empty string")
 	}
-	if !strings.HasSuffix(filepath.ToSlash(got), "downloadclean/accounts.json") {
-		t.Errorf("DefaultPath = %q, want suffix downloadclean/accounts.json", got)
+	if !strings.HasSuffix(filepath.ToSlash(got), "downloadclean/config.json") {
+		t.Errorf("DefaultConfigPath = %q, want suffix downloadclean/config.json", got)
 	}
 }

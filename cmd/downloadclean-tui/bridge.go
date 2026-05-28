@@ -11,6 +11,7 @@ import (
 	"github.com/janbalmer/downloadclean/internal/config"
 	"github.com/janbalmer/downloadclean/internal/dlc"
 	"github.com/janbalmer/downloadclean/internal/downloader"
+	"github.com/janbalmer/downloadclean/internal/extractor"
 	"github.com/janbalmer/downloadclean/internal/hoster"
 	"github.com/janbalmer/downloadclean/internal/hoster/rapidgator"
 	"github.com/janbalmer/downloadclean/internal/queue"
@@ -56,8 +57,10 @@ func loadAccountsCmd(accountsPath string, insecure bool) tea.Cmd {
 // events channel is closed before the error is sent on done, so a
 // waitForEvent that observes a closed channel knows the terminal event
 // will arrive via waitForDone. A non-nil limiter throttles every download
-// in the run; pass nil to disable throttling entirely.
-func runQueue(parent context.Context, jobs []queue.Job, limiter *downloader.RateLimiter) (
+// in the run; pass nil to disable throttling entirely. A non-nil extract
+// toggle wires post-download extraction (only runs when the toggle is
+// Enabled at the moment each download completes).
+func runQueue(parent context.Context, jobs []queue.Job, limiter *downloader.RateLimiter, extract *extractor.Toggle) (
 	*queue.Runner, context.CancelFunc, <-chan queue.Event, <-chan error,
 ) {
 	ctx, cancel := context.WithCancel(parent)
@@ -65,6 +68,7 @@ func runQueue(parent context.Context, jobs []queue.Job, limiter *downloader.Rate
 	done := make(chan error, 1)
 	runner := queue.NewRunner(jobs)
 	runner.RateLimiter = limiter
+	runner.Extractor = extract
 
 	go func() {
 		err := runner.Run(ctx, func(e queue.Event) {

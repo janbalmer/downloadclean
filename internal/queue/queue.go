@@ -13,6 +13,7 @@ import (
 
 	"github.com/janbalmer/downloadclean/internal/dlc"
 	"github.com/janbalmer/downloadclean/internal/downloader"
+	"github.com/janbalmer/downloadclean/internal/extractor"
 	"github.com/janbalmer/downloadclean/internal/hoster"
 )
 
@@ -48,6 +49,26 @@ const (
 	// EventSkipped is emitted when a job is intentionally not run
 	// (no hoster, or the destination file already exists).
 	EventSkipped
+	// EventExtractStarted is emitted just before 7zz is invoked on a
+	// completed archive (or multi-volume set). Event.Filename is the
+	// trigger volume; Event.DestPath is the directory extracted into.
+	EventExtractStarted
+	// EventExtractProgress is emitted as 7zz reports progress; the
+	// percentage is in Event.ExtractPercent.
+	EventExtractProgress
+	// EventExtractDone is emitted after a successful extraction. The
+	// original archive volume(s) have been removed from disk.
+	EventExtractDone
+	// EventExtractFailed is emitted when extraction fails. Event.Err is
+	// set; consumers can use errors.As to detect *extractor.ErrEncrypted
+	// (password required / wrong) or *extractor.ErrExtract (other 7zz
+	// failure).
+	EventExtractFailed
+	// EventExtractSkipped is emitted at end of Run for any multi-volume
+	// archive set whose trigger or siblings never arrived. Event.Filename
+	// is the canonical trigger volume name (which may not exist on disk);
+	// Event.Description spells out what's missing.
+	EventExtractSkipped
 )
 
 // String returns the constant's identifier (e.g. "EventStarted").
@@ -65,6 +86,16 @@ func (k EventKind) String() string {
 		return "EventFailed"
 	case EventSkipped:
 		return "EventSkipped"
+	case EventExtractStarted:
+		return "EventExtractStarted"
+	case EventExtractProgress:
+		return "EventExtractProgress"
+	case EventExtractDone:
+		return "EventExtractDone"
+	case EventExtractFailed:
+		return "EventExtractFailed"
+	case EventExtractSkipped:
+		return "EventExtractSkipped"
 	default:
 		return fmt.Sprintf("EventKind(%d)", int(k))
 	}
@@ -72,18 +103,19 @@ func (k EventKind) String() string {
 
 // Event reports queue progress. Total may be -1 if unknown.
 type Event struct {
-	Kind        EventKind
-	Index       int // 0-based index within the supplied job slice
-	Total       int // total number of jobs (grows if more are appended)
-	BatchID     int // mirrors Job.BatchID for the emitting job
-	Link        dlc.Link
-	Hoster      string // hoster name, e.g. "rapidgator" (empty for EventSkipped due to no hoster)
-	Filename    string // populated once known
-	Downloaded  int64
-	SizeBytes   int64 // -1 if unknown
-	DestPath    string
-	Err         error
-	Description string // human-readable note (skip reason, etc.)
+	Kind           EventKind
+	Index          int // 0-based index within the supplied job slice
+	Total          int // total number of jobs (grows if more are appended)
+	BatchID        int // mirrors Job.BatchID for the emitting job
+	Link           dlc.Link
+	Hoster         string // hoster name, e.g. "rapidgator" (empty for EventSkipped due to no hoster)
+	Filename       string // populated once known
+	Downloaded     int64
+	SizeBytes      int64 // -1 if unknown
+	DestPath       string
+	Err            error
+	Description    string // human-readable note (skip reason, etc.)
+	ExtractPercent int    // 0-100, populated only for EventExtractProgress
 }
 
 // ErrCollision is set on Event.Err when a job is skipped because the
@@ -111,11 +143,33 @@ type Runner struct {
 	// RateLimiter, if non-nil, throttles every Download in this run.
 	// Safe to mutate concurrently via its Set* methods.
 	RateLimiter *downloader.RateLimiter
+	// Extractor, if non-nil and Extractor.Enabled(), triggers archive
+	// extraction after each successful download. Multi-volume archive
+	// sets are extracted once their final volume completes; incomplete
+	// sets at end of Run produce EventExtractSkipped. Safe to mutate
+	// concurrently via Extractor's Set* methods.
+	Extractor *extractor.Toggle
+
+	// pending tracks multi-volume archive sets discovered during Run
+	// whose trigger or sibling volumes have not all arrived. Keyed by
+	// SetInfo.Key. Touched only on the Run goroutine, hence no mutex.
+	pending map[string]pendingExtract
+}
+
+// pendingExtract records a multi-volume set that cannot yet be extracted.
+// trigger is the canonical first-volume filename so end-of-run reporting
+// names something recognizable even when the trigger itself never arrived.
+type pendingExtract struct {
+	set     extractor.SetInfo
+	outDir  string
+	trigger string
 }
 
 // NewRunner returns a Runner pre-seeded with the given initial jobs.
 func NewRunner(initial []Job) *Runner {
-	r := &Runner{}
+	r := &Runner{
+		pending: make(map[string]pendingExtract),
+	}
 	if len(initial) > 0 {
 		r.jobs = append(r.jobs, initial...)
 	}
@@ -152,6 +206,7 @@ func (r *Runner) Run(ctx context.Context, on EventFn) error {
 		r.mu.Lock()
 		if i >= len(r.jobs) {
 			r.mu.Unlock()
+			r.sweepPending(emit)
 			return nil
 		}
 		job := r.jobs[i]
@@ -262,6 +317,11 @@ func (r *Runner) Run(ctx context.Context, on EventFn) error {
 		evDone.DestPath = dest
 		evDone.SizeBytes = size
 		emit(evDone)
+
+		r.maybeExtract(ctx, base, i, job.OutDir, filename, emit)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 	}
 }
 
@@ -269,6 +329,197 @@ func (r *Runner) Run(ctx context.Context, on EventFn) error {
 // callers (like the CLI) that don't need to append jobs mid-run.
 func Run(ctx context.Context, jobs []Job, on EventFn) error {
 	return NewRunner(jobs).Run(ctx, on)
+}
+
+// maybeExtract inspects the filename just produced by a successful download
+// and either extracts immediately, stashes the volume in r.pending until
+// siblings arrive, or returns silently (extractor off, non-archive file).
+// base carries Index/Total/BatchID/Link/Hoster pre-populated for the current
+// job so emitted extract events line up with the originating job; doneIndex
+// is the index of that job within r.jobs, used to look at the remaining
+// queue for sibling volumes.
+func (r *Runner) maybeExtract(ctx context.Context, base Event, doneIndex int, outDir, filename string, emit EventFn) {
+	if r.Extractor == nil || !r.Extractor.Enabled() {
+		return
+	}
+	if !extractor.IsArchive(filename) {
+		return
+	}
+	set := extractor.ArchiveSet(filename)
+	if set.Format == extractor.FormatUnknown {
+		return
+	}
+
+	trigger := extractor.TriggerVolume(set)
+
+	// Multi-volume sets defer extraction until no more siblings remain in
+	// the queue — otherwise enumerating the partial run on disk yields a
+	// contiguous-but-incomplete sequence that 7zz reports as truncated.
+	if extractor.IsMultiVolume(set) && r.hasPendingSiblings(doneIndex, set.Key) {
+		if _, ok := r.pending[set.Key]; !ok {
+			r.pending[set.Key] = pendingExtract{set: set, outDir: outDir, trigger: trigger}
+		}
+		return
+	}
+
+	volumes := extractor.EnumerateVolumes(outDir, set)
+	if len(volumes) == 0 {
+		// Single-file trigger missing (race / hoster mis-named it) or
+		// multi-volume non-trigger without trigger on disk. Either way,
+		// stash and let sweepPending report at end of run.
+		r.pending[set.Key] = pendingExtract{set: set, outDir: outDir, trigger: trigger}
+		return
+	}
+
+	r.runExtraction(ctx, base, outDir, volumes, emit)
+	delete(r.pending, set.Key)
+
+	// If this completion satisfied a previously-stashed sibling set, flush.
+	r.flushPending(ctx, doneIndex, base, emit)
+}
+
+// hasPendingSiblings reports whether any job in r.jobs[afterIndex+1:] is
+// likely to deliver another volume of the set identified by key. The check
+// is best-effort: it inspects Job.Link.Name and the URL basename — these
+// match in the common case (DLCs use real filenames; URLs end in them) —
+// and may miss hoster-rewritten names, in which case we extract early and
+// 7zz fails noisily. The user can re-trigger by re-running.
+func (r *Runner) hasPendingSiblings(afterIndex int, key string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := afterIndex + 1; i < len(r.jobs); i++ {
+		j := r.jobs[i]
+		for _, name := range []string{j.Link.Name, basenameFromURL(j.Link.URL)} {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			s := extractor.ArchiveSet(name)
+			if s.Format != extractor.FormatUnknown && s.Key == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// flushPending re-checks every stashed set for completeness and extracts
+// any that became whole and no longer have pending siblings in the queue.
+// Called after a successful extraction in case a sibling completion also
+// rounded out a different pending set, and at end of Run.
+func (r *Runner) flushPending(ctx context.Context, doneIndex int, base Event, emit EventFn) {
+	for key, entry := range r.pending {
+		if ctx.Err() != nil {
+			return
+		}
+		if extractor.IsMultiVolume(entry.set) && r.hasPendingSiblings(doneIndex, entry.set.Key) {
+			continue
+		}
+		volumes := extractor.EnumerateVolumes(entry.outDir, entry.set)
+		if len(volumes) == 0 {
+			continue
+		}
+		r.runExtraction(ctx, base, entry.outDir, volumes, emit)
+		delete(r.pending, key)
+	}
+}
+
+// sweepPending fires EventExtractSkipped for every entry still pending at
+// the end of Run. A final flushPending attempt runs first so any set that
+// completed during the tail of the job list still extracts. The doneIndex
+// passed to flushPending is past the end of the job list so the sibling
+// check sees no remaining queue.
+func (r *Runner) sweepPending(emit EventFn) {
+	r.mu.Lock()
+	endIdx := len(r.jobs)
+	r.mu.Unlock()
+	r.flushPending(context.Background(), endIdx, Event{SizeBytes: -1}, emit)
+	for key, entry := range r.pending {
+		ev := Event{
+			Kind:        EventExtractSkipped,
+			Filename:    entry.trigger,
+			DestPath:    entry.outDir,
+			SizeBytes:   -1,
+			Description: describePending(entry),
+		}
+		emit(ev)
+		delete(r.pending, key)
+	}
+}
+
+// describePending summarises why entry can't be extracted. It distinguishes
+// the "trigger never arrived" case from the "trigger present but siblings
+// missing" case — the latter we can't enumerate precisely without knowing
+// the total volume count.
+func describePending(entry pendingExtract) string {
+	if entry.trigger == "" {
+		return fmt.Sprintf("multi-volume set %s incomplete", entry.set.Key)
+	}
+	triggerPath := filepath.Join(entry.outDir, entry.trigger)
+	if _, err := os.Stat(triggerPath); err != nil {
+		return fmt.Sprintf("incomplete archive set; trigger volume %s missing", entry.trigger)
+	}
+	return fmt.Sprintf("incomplete archive set; siblings of %s missing", entry.trigger)
+}
+
+// runExtraction invokes the extractor on the supplied volume list and
+// emits EventExtractStarted/Progress/Done/Failed accordingly. On success
+// the volume files are removed; a removal error becomes a note on the
+// Done event rather than a failure (the archive contents are already
+// safely extracted).
+func (r *Runner) runExtraction(ctx context.Context, base Event, outDir string, volumes []string, emit EventFn) {
+	archiveName := volumes[0]
+	archivePath := filepath.Join(outDir, archiveName)
+
+	started := base
+	started.Kind = EventExtractStarted
+	started.Filename = archiveName
+	started.DestPath = outDir
+	emit(started)
+
+	passwords := r.Extractor.Passwords()
+	lastPct := -1
+	onProgress := func(pct int) {
+		if pct == lastPct {
+			return
+		}
+		lastPct = pct
+		ev := base
+		ev.Kind = EventExtractProgress
+		ev.Filename = archiveName
+		ev.DestPath = outDir
+		ev.ExtractPercent = pct
+		emit(ev)
+	}
+
+	if _, err := extractor.Extract(ctx, archivePath, outDir, passwords, onProgress); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		ev := base
+		ev.Kind = EventExtractFailed
+		ev.Filename = archiveName
+		ev.DestPath = outDir
+		ev.Err = err
+		emit(ev)
+		return
+	}
+
+	var removeErr error
+	for _, v := range volumes {
+		if err := os.Remove(filepath.Join(outDir, v)); err != nil && removeErr == nil {
+			removeErr = err
+		}
+	}
+
+	done := base
+	done.Kind = EventExtractDone
+	done.Filename = archiveName
+	done.DestPath = outDir
+	if removeErr != nil {
+		done.Description = fmt.Sprintf("archive(s) removed with errors: %v", removeErr)
+	}
+	emit(done)
 }
 
 func eventWith(base Event, kind EventKind, desc string) Event {

@@ -17,6 +17,7 @@ import (
 
 	"github.com/janbalmer/downloadclean/internal/dlc"
 	"github.com/janbalmer/downloadclean/internal/downloader"
+	"github.com/janbalmer/downloadclean/internal/extractor"
 	"github.com/janbalmer/downloadclean/internal/queue"
 )
 
@@ -355,6 +356,10 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.rateLimiter.SetEnabled(!m.rateLimiter.Enabled())
 			return m, nil
 		}
+		if key.Matches(msg, m.keys.ExtractToggle) {
+			m.extractToggle.SetEnabled(!m.extractToggle.Enabled())
+			return m, nil
+		}
 		if key.Matches(msg, m.keys.RateUp) {
 			if !m.rateLimiter.Enabled() {
 				m.rateLimiter.SetEnabled(true)
@@ -466,6 +471,7 @@ func viewDownloading(m model) string {
 		"",
 		m.progressFile.View()+"  "+pctLabel,
 		stats,
+		renderExtract(th, m.extractToggle, m.active),
 		renderRateLimit(th, m.rateLimiter),
 		"",
 		m.progressBatch.View()+"  "+batchLabel,
@@ -475,9 +481,12 @@ func viewDownloading(m model) string {
 	batchesHeader := th.Subtitle.Render("batches:")
 	batchesTable := renderBatchesTable(&m)
 
-	cancelHint := th.Muted.Render("a: add dlc · l: limit · +/-: rate · 0: off · q / ctrl+c: cancel")
+	// Two lines so the hint fits inside the 80-column minimum without
+	// wrapping mid-token: rate controls on top, extract + lifecycle below.
+	hintLine1 := th.Muted.Render("l: limit · +/-: rate · 0: off")
+	hintLine2 := th.Muted.Render("e: auto-extract · a: add dlc · q / ctrl+c: cancel")
 
-	parts := []string{activePanel, "", batchesHeader, batchesTable, "", cancelHint}
+	parts := []string{activePanel, "", batchesHeader, batchesTable, "", hintLine1, hintLine2}
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
@@ -491,6 +500,25 @@ func renderRateLimit(th Theme, lim *downloader.RateLimiter) string {
 	}
 	mbit := lim.BytesPerSec() / bytesPerMbit
 	return th.Muted.Render("rate limit: ") + th.Accent.Render(fmt.Sprintf("%.1f Mbit/s", mbit))
+}
+
+// renderExtract returns the single-line "auto-extract: …" indicator shown
+// in the active panel. While extraction is running for the current job the
+// line switches to "extracting: <filename>  NN%" so the user sees real-time
+// progress; otherwise it just reflects the toggle state.
+func renderExtract(th Theme, tog *extractor.Toggle, a activeJob) string {
+	if a.extracting {
+		label := a.extractFile
+		if label == "" {
+			label = "archive"
+		}
+		return th.Muted.Render("extracting: ") +
+			th.Accent.Render(fmt.Sprintf("%s  %d%%", label, a.extractPct))
+	}
+	if tog.Enabled() {
+		return th.Muted.Render("auto-extract: ") + th.Accent.Render("on")
+	}
+	return th.Muted.Render("auto-extract: off")
 }
 
 // renderBatchesTable lays out the per-batch status table on the downloading
@@ -681,7 +709,7 @@ func startBatch(m model) (tea.Model, tea.Cmd) {
 	}}
 	m.nextBatchID++
 
-	runner, cancel, events, errs := runQueue(context.Background(), m.jobs, m.rateLimiter)
+	runner, cancel, events, errs := runQueue(context.Background(), m.jobs, m.rateLimiter, m.extractToggle)
 	m.runner = runner
 	m.cancel = cancel
 	m.events = events
@@ -786,6 +814,9 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 		m.active.lastSampleAt = time.Time{}
 		m.active.lastSampleDown = 0
 		m.active.smoothedSpeed = 0
+		m.active.extracting = false
+		m.active.extractFile = ""
+		m.active.extractPct = 0
 		return m.progressFile.SetPercent(0)
 
 	case queue.EventResolved:
@@ -851,6 +882,42 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 		m.skipped++
 		m.active.total = ev.Total
 		return m.progressBatch.SetPercent(m.batchPct())
+
+	case queue.EventExtractStarted:
+		m.active.extracting = true
+		m.active.extractFile = ev.Filename
+		m.active.extractPct = 0
+		return nil
+
+	case queue.EventExtractProgress:
+		// A late progress tick can arrive after Done/Failed cleared the
+		// indicator; ignore it so the panel doesn't flash an extra row.
+		if !m.active.extracting {
+			return nil
+		}
+		m.active.extractPct = ev.ExtractPercent
+		return nil
+
+	case queue.EventExtractDone:
+		m.active.extracting = false
+		m.active.extractFile = ""
+		m.active.extractPct = 0
+		return nil
+
+	case queue.EventExtractFailed:
+		// Extraction failure is non-fatal for the queue — the downloaded
+		// archive stays on disk. Clear the indicator; the underlying error
+		// is preserved in ev.Err (encrypted, missing 7zz, CRC, …) and could
+		// surface in a future banner without changing the active-panel layout.
+		m.active.extracting = false
+		m.active.extractFile = ""
+		m.active.extractPct = 0
+		return nil
+
+	case queue.EventExtractSkipped:
+		// Emitted only at end of Run for incomplete multi-volume sets; it has
+		// no bearing on the currently-active job. No download counter changes.
+		return nil
 	}
 	return nil
 }

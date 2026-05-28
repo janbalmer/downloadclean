@@ -11,12 +11,15 @@ a plain CLI and a Bubble Tea TUI; both wrap the same `internal/` packages.
 ```
 cmd/downloadclean/        CLI entry point. Prints to stdout, exit 1 on failure.
 cmd/downloadclean-tui/    Bubble Tea TUI. Cyberpunk palette + drag-drop picker.
-internal/config/          accounts.json loader + XDG path resolution.
+internal/config/          accounts.json + config.json loaders, XDG paths,
+                          shared credential-file security helpers.
 internal/dlc/             .dlc decryption + XML parsing.
 internal/hoster/          Hoster interface + Registry.
 internal/hoster/rapidgator/  rapidgator.net premium client (v2 API).
 internal/downloader/      Streaming HTTP GET with Range resume + progress.
 internal/queue/           Sequential Job runner emitting events.
+internal/extractor/       Post-download 7zz invocation with multi-volume
+                          detection (single archive set extracted per call).
 ```
 
 The split exists so both front-ends reuse every `internal/` package without
@@ -30,6 +33,23 @@ stored on the model — `Ctrl+C` / `q` on the downloading screen calls
 `m.cancel()` and waits for `queueDoneMsg` rather than quitting Bubble Tea
 directly, so `.part` files remain on disk for resume.
 
+`internal/extractor/` shells out to `7zz` (with `7z` fallback) to unpack
+archives after each successful download. Multi-volume detection
+(modern `.partNN.rar`, split `.7z.NNN`, legacy `.rar`+`.r00..rNN`) lives
+here as pure helpers — `ArchiveSet` returns metadata, `EnumerateVolumes`
+scans the destination dir for the actual files, and `TriggerVolume`
+names the canonical first volume of a set. The queue orchestrates:
+after each `EventDone` for an archive, it stashes non-trigger volumes in
+`Runner.pending`, fires `extractor.Extract` only when all siblings are
+present, and at end-of-`Run` emits `EventExtractSkipped` for sets whose
+siblings never arrived. Like `RateLimiter`, `Runner.Extractor` is a
+pointer to an internally-synchronized `extractor.Toggle` — the TUI
+flips state mid-run without races. Encrypted archives use `-p-` to fail
+fast, then retry with each password from
+`~/.config/downloadclean/config.json`'s `archive_passwords` list.
+Successful extraction deletes every volume in the set; cancellation or
+failure leaves them on disk (same philosophy as `.part`).
+
 ## Hard constraints
 
 - **`internal/` stays dependency-free.** Only `cmd/downloadclean-tui/`
@@ -40,11 +60,13 @@ directly, so `.part` files remain on disk for resume.
   Do not introduce goroutine fan-out without a design discussion.
 - **Premium-only Rapidgator.** Free-tier (captcha, wait timers) is explicitly
   out of scope for now.
-- **The repo is public on GitHub.** `accounts.json` is gitignored and the
-  config loader (on Unix) refuses symlinked credential files, world/group-
-  readable credential files, and world/group-writable parent directories.
-  All three checks can be bypassed with `--insecure-config`. Preserve every
-  one of these safeguards.
+- **The repo is public on GitHub.** `accounts.json` and `config.json` (which
+  holds archive passwords) are gitignored and both go through the same
+  loader-side security checks: refuse symlinked credential files,
+  world/group-readable credential files, and world/group-writable parent
+  directories. All three can be bypassed with `--insecure-config`. The
+  shared helper lives in `internal/config/security.go` — use it for any
+  new credential file. Preserve every one of these safeguards.
 
 ## DLC decryption notes
 
@@ -88,6 +110,9 @@ this hook, and end users can swap in a mirror if AppWork's service is down.
 
 ## Deferred (don't build unprompted)
 
-Parallel downloads, retry/backoff, bandwidth caps, free-tier flows, RSDF/CCF,
-persistent queue, additional hosters. These are roadmap items, not lurking
-work.
+Parallel downloads, retry/backoff, free-tier flows, RSDF/CCF, persistent
+queue, additional hosters, recursive extraction (archive-inside-archive),
+tar-compound second-pass (`.tar.gz` extracts to `.tar` only), interactive
+password prompts (passwords come from `config.json` only), persisted
+extract-toggle state (session-only, matching rate-limit). These are
+roadmap items, not lurking work.

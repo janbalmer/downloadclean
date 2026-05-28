@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/janbalmer/downloadclean/internal/config"
 	"github.com/janbalmer/downloadclean/internal/dlc"
+	"github.com/janbalmer/downloadclean/internal/extractor"
 	"github.com/janbalmer/downloadclean/internal/hoster"
 	"github.com/janbalmer/downloadclean/internal/hoster/rapidgator"
 	"github.com/janbalmer/downloadclean/internal/queue"
@@ -28,11 +30,13 @@ func main() {
 func run() error {
 	var (
 		accountsPath = flag.String("accounts", config.DefaultPath(), "path to accounts.json")
+		configPath   = flag.String("config", config.DefaultConfigPath(), "path to config.json (archive passwords, etc.); missing file is ignored")
 		dlcPath      = flag.String("dlc", "", "path to .dlc file (required)")
 		outDir       = flag.String("output", config.DefaultOutputDir(), "directory to download into")
-		insecure     = flag.Bool("insecure-config", false, "skip the file-permission check on accounts.json")
+		insecure     = flag.Bool("insecure-config", false, "skip the file-permission checks on accounts.json and config.json")
 		list         = flag.Bool("list", false, "decrypt and print links, do not download")
 		limit        = flag.Int("limit", 0, "download at most this many links (0 = all)")
+		extract      = flag.Bool("extract", false, "auto-extract downloaded archives and delete the archive on success")
 	)
 	flag.Parse()
 
@@ -71,11 +75,15 @@ func run() error {
 	}
 
 	if *insecure {
-		fmt.Fprintln(os.Stderr, "warning: --insecure-config: skipping file-permission checks on accounts.json")
+		fmt.Fprintln(os.Stderr, "warning: --insecure-config: skipping file-permission checks on accounts.json and config.json")
 	}
 	accs, err := config.Load(*accountsPath, *insecure)
 	if err != nil {
 		return err
+	}
+	cfg, err := config.LoadConfig(*configPath, *insecure)
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
 	}
 
 	reg := hoster.NewRegistry()
@@ -97,8 +105,16 @@ func run() error {
 		jobs = append(jobs, queue.Job{Link: l, Hoster: h, OutDir: *outDir})
 	}
 
+	runner := queue.NewRunner(jobs)
+	if *extract {
+		tog := extractor.NewToggle()
+		tog.SetEnabled(true)
+		tog.SetPasswords(cfg.ArchivePasswords)
+		runner.Extractor = tog
+	}
+
 	printer := newPrinter()
-	if err := queue.Run(ctx, jobs, printer.handle); err != nil {
+	if err := runner.Run(ctx, printer.handle); err != nil {
 		return err
 	}
 	printer.summary()
@@ -109,10 +125,13 @@ func run() error {
 }
 
 type printer struct {
-	done    int
-	failed  int
-	skipped int
-	lastLen int
+	done           int
+	failed         int
+	skipped        int
+	extracted      int
+	extractFailed  int
+	extractSkipped int
+	lastLen        int
 }
 
 func newPrinter() *printer {
@@ -132,7 +151,7 @@ func (p *printer) write(line string) {
 }
 
 func (p *printer) handle(e queue.Event) {
-	tag := fmt.Sprintf("[%d/%d]", e.Index+1, e.Total)
+	tag := eventTag(e)
 	switch e.Kind {
 	case queue.EventStarted:
 		p.clearLine()
@@ -153,12 +172,72 @@ func (p *printer) handle(e queue.Event) {
 	case queue.EventSkipped:
 		fmt.Fprintf(os.Stdout, "%s skipped: %s — %s\n", tag, e.Link.URL, e.Description)
 		p.skipped++
+	case queue.EventExtractStarted:
+		p.clearLine()
+		fmt.Fprintf(os.Stdout, "%s extract: %s\n", tag, e.Filename)
+	case queue.EventExtractProgress:
+		p.clearLine()
+		// %3d keeps the percent column fixed so the overwriting line doesn't
+		// jitter as the value crosses 10 and 100.
+		p.write(fmt.Sprintf("%s extracting: %s  %3d%%", tag, e.Filename, clampPct(e.ExtractPercent)))
+	case queue.EventExtractDone:
+		p.clearLine()
+		if e.Description != "" {
+			fmt.Fprintf(os.Stdout, "%s extracted: %s — %s\n", tag, e.Filename, e.Description)
+		} else {
+			fmt.Fprintf(os.Stdout, "%s extracted: %s\n", tag, e.Filename)
+		}
+		p.extracted++
+	case queue.EventExtractFailed:
+		p.clearLine()
+		reason := extractFailureReason(e.Err)
+		fmt.Fprintf(os.Stdout, "%s extract failed: %s — %s\n", tag, e.Filename, reason)
+		p.extractFailed++
+	case queue.EventExtractSkipped:
+		p.clearLine()
+		fmt.Fprintf(os.Stdout, "%s extract skipped: %s — %s\n", tag, e.Filename, e.Description)
+		p.extractSkipped++
 	}
+}
+
+// eventTag formats the per-event "[i/n]" prefix. Sweep-time extract events
+// (emitted by queue.sweepPending at end of Run) have no originating job and
+// arrive with Total == 0; for those a positional tag would be nonsensical,
+// so it is omitted.
+func eventTag(e queue.Event) string {
+	if e.Total <= 0 {
+		return "[--]"
+	}
+	return fmt.Sprintf("[%d/%d]", e.Index+1, e.Total)
+}
+
+// clampPct constrains an extractor progress value into the 0-100 display
+// range so a malformed 7zz line never produces a "120%" or "-5%" frame.
+func clampPct(p int) int {
+	return min(100, max(0, p))
+}
+
+// extractFailureReason maps an extraction error to a short human-readable
+// description, collapsing the encrypted-archive case to a stable string the
+// user can search for instead of the raw "extractor: ... encrypted ..."
+// wrapping.
+func extractFailureReason(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	var enc *extractor.ErrEncrypted
+	if errors.As(err, &enc) {
+		return "encrypted, no working password"
+	}
+	return err.Error()
 }
 
 func (p *printer) summary() {
 	p.clearLine()
 	fmt.Fprintf(os.Stdout, "summary: %d done, %d failed, %d skipped\n", p.done, p.failed, p.skipped)
+	if p.extracted > 0 || p.extractFailed > 0 || p.extractSkipped > 0 {
+		fmt.Fprintf(os.Stdout, "extract: %d extracted, %d failed, %d skipped\n", p.extracted, p.extractFailed, p.extractSkipped)
+	}
 }
 
 func progressBar(done, total int64) string {

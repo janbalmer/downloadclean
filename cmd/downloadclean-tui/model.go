@@ -18,6 +18,7 @@ import (
 	"github.com/janbalmer/downloadclean/internal/config"
 	"github.com/janbalmer/downloadclean/internal/dlc"
 	"github.com/janbalmer/downloadclean/internal/downloader"
+	"github.com/janbalmer/downloadclean/internal/extractor"
 	"github.com/janbalmer/downloadclean/internal/hoster"
 	"github.com/janbalmer/downloadclean/internal/queue"
 )
@@ -41,6 +42,7 @@ const (
 // pass it back into commands without going through globals.
 type flags struct {
 	accountsPath string
+	configPath   string
 	outputDir    string
 	insecure     bool
 	initialDLC   string
@@ -60,6 +62,13 @@ type activeJob struct {
 	lastSampleAt   time.Time
 	lastSampleDown int64
 	smoothedSpeed  float64
+
+	// extracting reports whether a post-download extraction is currently
+	// running for this job; extractFile names the trigger volume and
+	// extractPct is the most recent percentage reported by 7zz.
+	extracting  bool
+	extractFile string
+	extractPct  int
 }
 
 // batchInfo is one row in the batches table on the downloading screen. The
@@ -84,20 +93,21 @@ func (b batchInfo) finished() int { return b.done + b.failed + b.skipped }
 // the active screen is consulted to filter which bindings the help footer
 // advertises at any given moment.
 type keyMap struct {
-	Quit       key.Binding
-	Help       key.Binding
-	Up         key.Binding
-	Down       key.Binding
-	Enter      key.Binding
-	Toggle     key.Binding
-	SelectAll  key.Binding
-	SelectNone key.Binding
-	Back       key.Binding
-	Rerun      key.Binding
-	AddDLC     key.Binding
-	RateToggle key.Binding
-	RateUp     key.Binding
-	RateDown   key.Binding
+	Quit          key.Binding
+	Help          key.Binding
+	Up            key.Binding
+	Down          key.Binding
+	Enter         key.Binding
+	Toggle        key.Binding
+	SelectAll     key.Binding
+	SelectNone    key.Binding
+	Back          key.Binding
+	Rerun         key.Binding
+	AddDLC        key.Binding
+	RateToggle    key.Binding
+	RateUp        key.Binding
+	RateDown      key.Binding
+	ExtractToggle key.Binding
 
 	activeScreen screen
 }
@@ -105,20 +115,21 @@ type keyMap struct {
 // newKeyMap returns a keyMap with every binding pre-populated.
 func newKeyMap() keyMap {
 	return keyMap{
-		Quit:       key.NewBinding(key.WithKeys("ctrl+c", "q"), key.WithHelp("q", "quit")),
-		Help:       key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
-		Up:         key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
-		Down:       key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
-		Enter:      key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "confirm")),
-		Toggle:     key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle")),
-		SelectAll:  key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "select all")),
-		SelectNone: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "select none")),
-		Back:       key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
-		Rerun:      key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rerun failed")),
-		AddDLC:     key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add dlc")),
-		RateToggle: key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "rate limit")),
-		RateUp:     key.NewBinding(key.WithKeys("+", "="), key.WithHelp("+", "+0.5 Mbit/s")),
-		RateDown:   key.NewBinding(key.WithKeys("-", "_"), key.WithHelp("-", "-0.5 Mbit/s")),
+		Quit:          key.NewBinding(key.WithKeys("ctrl+c", "q"), key.WithHelp("q", "quit")),
+		Help:          key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Up:            key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
+		Down:          key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
+		Enter:         key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "confirm")),
+		Toggle:        key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "toggle")),
+		SelectAll:     key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "select all")),
+		SelectNone:    key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "select none")),
+		Back:          key.NewBinding(key.WithKeys("esc"), key.WithHelp("esc", "back")),
+		Rerun:         key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rerun failed")),
+		AddDLC:        key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add dlc")),
+		RateToggle:    key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "rate limit")),
+		RateUp:        key.NewBinding(key.WithKeys("+", "="), key.WithHelp("+", "+0.5 Mbit/s")),
+		RateDown:      key.NewBinding(key.WithKeys("-", "_"), key.WithHelp("-", "-0.5 Mbit/s")),
+		ExtractToggle: key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "auto-extract")),
 	}
 }
 
@@ -130,7 +141,7 @@ func (k keyMap) ShortHelp() []key.Binding {
 	case screenParsed:
 		return []key.Binding{k.Up, k.Down, k.Toggle, k.SelectAll, k.SelectNone, k.Enter, k.Back, k.Help, k.Quit}
 	case screenDownloading:
-		return []key.Binding{k.AddDLC, k.RateToggle, k.RateUp, k.RateDown, k.Quit, k.Help}
+		return []key.Binding{k.AddDLC, k.RateToggle, k.RateUp, k.RateDown, k.ExtractToggle, k.Quit, k.Help}
 	case screenSummary:
 		return []key.Binding{k.Rerun, k.Back, k.Quit, k.Help}
 	}
@@ -143,7 +154,7 @@ func (k keyMap) FullHelp() [][]key.Binding {
 		{k.Up, k.Down, k.Enter, k.Back},
 		{k.Toggle, k.SelectAll, k.SelectNone},
 		{k.AddDLC, k.Rerun, k.Help, k.Quit},
-		{k.RateToggle, k.RateUp, k.RateDown},
+		{k.RateToggle, k.RateUp, k.RateDown, k.ExtractToggle},
 	}
 }
 
@@ -191,15 +202,18 @@ type model struct {
 
 	summaryErr error
 
-	rateLimiter *downloader.RateLimiter
+	rateLimiter   *downloader.RateLimiter
+	extractToggle *extractor.Toggle
 
 	keys keyMap
 	help help.Model
 }
 
 // newModel constructs the initial model and pre-configures every bubble
-// with theme-tinted styles.
-func newModel(f flags) model {
+// with theme-tinted styles. cfg supplies non-credential settings (notably
+// archive passwords for the extractor) and may be nil; a nil cfg behaves
+// the same as an empty Config.
+func newModel(f flags, cfg *config.Config) model {
 	th := NewTheme()
 
 	ti := textinput.New()
@@ -237,6 +251,14 @@ func newModel(f flags) model {
 	rl := downloader.NewRateLimiter()
 	rl.SetBytesPerSec(10.0 * bytesPerMbit)
 
+	// Extraction starts disabled — the user opts in with `e` on the
+	// downloading screen. Passwords come from config.json so the user can
+	// keep their archive password list outside the binary.
+	et := extractor.NewToggle()
+	if cfg != nil {
+		et.SetPasswords(cfg.ArchivePasswords)
+	}
+
 	h := help.New()
 	h.Styles.ShortKey = th.KeyHint
 	h.Styles.ShortDesc = th.Muted
@@ -256,6 +278,7 @@ func newModel(f flags) model {
 		progressFile:  pf,
 		progressBatch: pb,
 		rateLimiter:   rl,
+		extractToggle: et,
 		keys:          newKeyMap(),
 		help:          h,
 	}
