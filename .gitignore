@@ -2,6 +2,9 @@
 accounts.json
 **/accounts.json
 *.accounts.json
+config.json
+**/config.json
+*.config.json
 .env
 .env.*
 

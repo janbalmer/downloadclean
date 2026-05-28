@@ -74,15 +74,34 @@ go build -o downloadclean-tui ./cmd/downloadclean-tui
 
 ## Configure
 
+### `accounts.json` (required)
+
 Create `~/.config/downloadclean/accounts.json` (see `accounts.example.json`):
 
 ```json
 { "rapidgator": { "login": "you@example.com", "password": "secret" } }
 ```
 
-On Unix, the file must be `chmod 600`, must not be a symlink, and its parent
-directory must not be group- or world-writable. The tool refuses to load
-credentials otherwise (override with `--insecure-config`).
+### `config.json` (optional)
+
+Application-level settings — currently just the archive-password list used by
+the auto-extractor — live in `~/.config/downloadclean/config.json` (see
+`config.example.json`):
+
+```json
+{ "archive_passwords": ["first-password-to-try", "fallback"] }
+```
+
+Passwords are tried in order against encrypted archives; an empty or missing
+file means no passwords are tried. The file is loaded only when the
+auto-extractor runs, so it is fine to omit entirely.
+
+### Permissions
+
+Both files hold credential material. On Unix each must be `chmod 600`, must
+not be a symlink, and its parent directory must not be group- or
+world-writable. The tool refuses to load otherwise (override with
+`--insecure-config`).
 
 ## Use (CLI)
 
@@ -96,10 +115,11 @@ Flags:
 | -------------------- | ---------------------------------------------- |
 | `--dlc`              | (required) path to a `.dlc` file               |
 | `--accounts`         | `$XDG_CONFIG_HOME/downloadclean/accounts.json` |
+| `--config`           | `$XDG_CONFIG_HOME/downloadclean/config.json`   |
 | `--output`           | `$XDG_DOWNLOAD_DIR` or `~/Downloads`           |
 | `--list`             | decrypt and print links, do not download       |
 | `--limit`            | download at most N links (0 = all)             |
-| `--insecure-config`  | skip the accounts-file permission checks       |
+| `--insecure-config`  | skip permission checks on accounts and config  |
 
 Set `DOWNLOADCLEAN_DLC_SERVICE` to override the dlcrypt endpoint if AppWork's
 default service is unreachable. The format string takes one `%s` placeholder
@@ -133,8 +153,9 @@ Flags mirror the CLI's:
 | -------------------- | ---------------------------------------------- |
 | `[dlc-path]`         | optional positional; skips the picker          |
 | `--accounts`         | `$XDG_CONFIG_HOME/downloadclean/accounts.json` |
+| `--config`           | `$XDG_CONFIG_HOME/downloadclean/config.json`   |
 | `--output`           | `$XDG_DOWNLOAD_DIR` or `~/Downloads`           |
-| `--insecure-config`  | skip the accounts-file permission checks       |
+| `--insecure-config`  | skip permission checks on accounts and config  |
 
 The neon palette assumes a dark, truecolor-capable terminal. On
 256-colour terminals the look degrades gracefully but the magenta/violet
