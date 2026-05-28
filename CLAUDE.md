@@ -33,12 +33,28 @@ stored on the model — `Ctrl+C` / `q` on the downloading screen calls
 `m.cancel()` and waits for `queueDoneMsg` rather than quitting Bubble Tea
 directly, so `.part` files remain on disk for resume.
 
+There is no dedicated summary screen. When `queue.Run` returns the model
+sets `queueComplete` and stays on the downloading screen; `viewDownloading`
+swaps its active-job panel for a `COMPLETE` / `CANCELLED` banner with the
+done/skipped/failed counters. Post-completion the `e` key re-runs
+extraction over every successful download tracked in `m.completedFiles`
+via `queue.Runner.ExtractCompleted` (same event types as the in-Run
+extract pass, so the existing `applyQueueEvent` arms light up unchanged);
+the banner shows `EXTRACTING…` while the pass is in flight. `r` reruns
+failed jobs, `esc` resets to the picker, and `a` opens the add-DLC flow
+which routes through `startBatch` (not `appendBatch`) once the runner has
+exited.
+
 `internal/extractor/` shells out to `7zz` (with `7z` fallback) to unpack
 archives after each successful download. Multi-volume detection
 (modern `.partNN.rar`, split `.7z.NNN`, legacy `.rar`+`.r00..rNN`) lives
 here as pure helpers — `ArchiveSet` returns metadata, `EnumerateVolumes`
 scans the destination dir for the actual files, and `TriggerVolume`
-names the canonical first volume of a set. The queue orchestrates:
+names the canonical first volume of a set. `ArchiveSet` only sees a
+filename, so `name.rar` always classifies as `FormatRar` single;
+`EnumerateVolumes` re-probes the directory and uses the legacy path
+when `name.r00..rNN` siblings are present so the deletion sweep clears
+every volume. The queue orchestrates:
 after each `EventDone` for an archive, it stashes non-trigger volumes in
 `Runner.pending`, fires `extractor.Extract` only when all siblings are
 present, and at end-of-`Run` emits `EventExtractSkipped` for sets whose

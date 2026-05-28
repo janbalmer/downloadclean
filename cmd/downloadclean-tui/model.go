@@ -36,7 +36,6 @@ const (
 	screenPicker screen = iota
 	screenParsed
 	screenDownloading
-	screenSummary
 )
 
 // flags mirrors the CLI's flag surface. Stored on the model so screens can
@@ -110,7 +109,8 @@ type keyMap struct {
 	RateDown      key.Binding
 	ExtractToggle key.Binding
 
-	activeScreen screen
+	activeScreen  screen
+	queueComplete bool // mirrors model.queueComplete for ShortHelp dispatch
 }
 
 // newKeyMap returns a keyMap with every binding pre-populated.
@@ -142,9 +142,10 @@ func (k keyMap) ShortHelp() []key.Binding {
 	case screenParsed:
 		return []key.Binding{k.Up, k.Down, k.Toggle, k.SelectAll, k.SelectNone, k.Enter, k.Back, k.Help, k.Quit}
 	case screenDownloading:
+		if k.queueComplete {
+			return []key.Binding{k.ExtractToggle, k.AddDLC, k.Rerun, k.Back, k.Quit, k.Help}
+		}
 		return []key.Binding{k.AddDLC, k.RateToggle, k.RateUp, k.RateDown, k.ExtractToggle, k.Quit, k.Help}
-	case screenSummary:
-		return []key.Binding{k.Rerun, k.Back, k.Quit, k.Help}
 	}
 	return []key.Binding{k.Quit, k.Help}
 }
@@ -200,6 +201,19 @@ type model struct {
 	failed        int
 	skipped       int
 	cancelled     bool
+
+	// queueComplete is set after queue.Run has returned (success or cancel).
+	// The downloading screen stays visible and swaps its active-job panel
+	// for a completion banner; key bindings expand to include rerun / esc /
+	// add and re-purpose `e` to trigger extract-now over completedFiles.
+	queueComplete bool
+	// completedFiles tracks every successful download from the current
+	// session (cleared by resetBatchState) so the extract-now path can
+	// hand them to queue.Runner.ExtractCompleted.
+	completedFiles []queue.CompletedFile
+	// extractingNow flips while a post-completion extract pass runs so the
+	// completion banner reads "EXTRACTING…" instead of "COMPLETE".
+	extractingNow bool
 
 	summaryErr error
 
@@ -343,14 +357,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.summaryErr = msg.Err
 		// Tear down the add-DLC flow if it was still open; either way, the
-		// download session is over.
+		// download (or extract-now) session is over. If the user was on
+		// the picker / parsed screen via add-DLC, pull them back to the
+		// downloading screen so they see the completion banner.
+		if m.addMode {
+			m.screen = screenDownloading
+		}
 		m.addMode = false
 		m.addSourcePath = ""
 		m.links = nil
 		m.selected = nil
 		m.pathInput.Reset()
 		m.parseBanner = ""
-		m.screen = screenSummary
+		// viewDownloading branches on queueComplete to swap the active-
+		// job panel for a completion banner. extractingNow could be set
+		// if this msg ends a post-completion extract-now pass; clear it
+		// so the banner returns to "COMPLETE".
+		m.queueComplete = true
+		m.extractingNow = false
 		m.cancel = nil
 		return m, nil
 
@@ -370,8 +394,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return updateParsed(m, msg)
 	case screenDownloading:
 		return updateDownloading(m, msg)
-	case screenSummary:
-		return updateSummary(m, msg)
 	}
 	return m, nil
 }
@@ -387,6 +409,7 @@ func (m model) View() string {
 	}
 
 	m.keys.activeScreen = m.screen
+	m.keys.queueComplete = m.queueComplete
 
 	var body string
 	switch m.screen {
@@ -396,8 +419,6 @@ func (m model) View() string {
 		body = viewParsed(m)
 	case screenDownloading:
 		body = viewDownloading(m)
-	case screenSummary:
-		body = viewSummary(m)
 	}
 
 	helpView := m.help.View(m.keys)
@@ -449,6 +470,9 @@ func (m *model) resetBatchState() {
 	m.err = nil
 	m.summaryErr = nil
 	m.addMode = false
+	m.queueComplete = false
+	m.completedFiles = nil
+	m.extractingNow = false
 }
 
 // humanSize formats a byte count in 1024-base units, mirroring the CLI.

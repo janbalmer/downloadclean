@@ -331,6 +331,79 @@ func Run(ctx context.Context, jobs []Job, on EventFn) error {
 	return NewRunner(jobs).Run(ctx, on)
 }
 
+// CompletedFile names a single download that finished successfully during
+// a previous [Runner.Run]. It carries the destination directory the file
+// was written into and its on-disk filename — the two pieces of state
+// [Runner.ExtractCompleted] needs to re-trigger extraction.
+type CompletedFile struct {
+	OutDir   string
+	Filename string
+}
+
+// ExtractCompleted re-runs the post-download extraction step over a list of
+// previously-completed downloads. Front-ends use it for the "I forgot to
+// enable auto-extract" workflow: after Run has returned, the TUI hands back
+// every successful download and ExtractCompleted treats each archive set
+// the same way the in-Run path would have. The Runner's Extractor must be
+// non-nil; its Enabled() state is not consulted — the call itself is opt-in.
+//
+// Multi-volume sets are deduplicated by (outDir, SetInfo.Key) so each set
+// is processed once regardless of how many of its volumes appear in files.
+// Sets with missing volumes (incomplete on disk) emit [EventExtractSkipped];
+// sets whose volumes are no longer on disk (already extracted, or never
+// downloaded) are silent no-ops. Safe to call after Run has returned.
+//
+// Cancelling ctx terminates the in-flight 7zz call and returns ctx.Err();
+// not-yet-processed sets are left untouched on disk.
+func (r *Runner) ExtractCompleted(ctx context.Context, files []CompletedFile, emit EventFn) error {
+	if r.Extractor == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, f := range files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !extractor.IsArchive(f.Filename) {
+			continue
+		}
+		set := extractor.ArchiveSet(f.Filename)
+		if set.Format == extractor.FormatUnknown {
+			continue
+		}
+		dedupeKey := f.OutDir + "\x00" + set.Key
+		if seen[dedupeKey] {
+			continue
+		}
+		seen[dedupeKey] = true
+
+		trigger := extractor.TriggerVolume(set)
+		volumes := extractor.EnumerateVolumes(f.OutDir, set)
+		if len(volumes) == 0 {
+			// Either the volumes were already cleaned up after a prior
+			// extraction or the multi-volume set never completed. Report
+			// the latter so the user knows something is missing; we can't
+			// distinguish the two cases without remembering prior runs.
+			if emit != nil {
+				emit(Event{
+					Kind:        EventExtractSkipped,
+					Filename:    trigger,
+					DestPath:    f.OutDir,
+					SizeBytes:   -1,
+					Description: "archive incomplete or already extracted",
+				})
+			}
+			continue
+		}
+
+		r.runExtraction(ctx, Event{SizeBytes: -1}, f.OutDir, volumes, emit)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
 // maybeExtract inspects the filename just produced by a successful download
 // and either extracts immediately, stashes the volume in r.pending until
 // siblings arrive, or returns silently (extractor off, non-archive file).

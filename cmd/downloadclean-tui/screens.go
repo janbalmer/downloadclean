@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -262,6 +263,22 @@ func updateParsed(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.parseBanner = ""
 			if m.addMode {
+				if m.queueComplete {
+					// Runner.Run already returned, so Append would drop
+					// these jobs silently. Reset and start a fresh batch
+					// — registry/accounts are still loaded from the
+					// initial batch so we can skip loadAccountsCmd.
+					links := m.links
+					selected := m.selected
+					accounts := m.accounts
+					registry := m.registry
+					m.resetBatchState()
+					m.links = links
+					m.selected = selected
+					m.accounts = accounts
+					m.registry = registry
+					return startBatch(m)
+				}
 				// Registry/accounts were already loaded for the initial
 				// batch; reuse them for the appended batch.
 				return appendBatch(m)
@@ -333,62 +350,29 @@ func viewParsed(m model) string {
 	)
 }
 
-// updateDownloading handles input and events while the queue runs.
+// updateDownloading handles input and events while the queue runs and after
+// it completes. While running, every key drives queue/limiter state; after
+// queueComplete it pivots into a "post-run" mode where `e` triggers extract-
+// now over completedFiles, `r` reruns failed jobs, and `esc` returns to the
+// picker — the bindings the deleted summary screen used to own.
 func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		if key.Matches(msg, m.keys.AddDLC) {
-			// Drop into the picker screen in add mode. The queue keeps
-			// running in its goroutine; the event channel keeps draining
-			// because waitForEvent re-arms itself after every message.
-			m.addMode = true
-			m.addReturnTo = screenDownloading
-			m.err = nil
-			m.parseBanner = ""
-			m.pathInput.Reset()
-			m.pathInput.Focus()
-			m.links = nil
-			m.selected = nil
-			m.screen = screenPicker
-			return m, tea.Batch(textinput.Blink, m.parseSpinner.Tick)
-		}
-		if key.Matches(msg, m.keys.RateToggle) {
-			m.rateLimiter.SetEnabled(!m.rateLimiter.Enabled())
-			return m, nil
-		}
-		if key.Matches(msg, m.keys.ExtractToggle) {
-			m.extractToggle.SetEnabled(!m.extractToggle.Enabled())
-			return m, nil
-		}
-		if key.Matches(msg, m.keys.RateUp) {
-			if !m.rateLimiter.Enabled() {
-				m.rateLimiter.SetEnabled(true)
-			}
-			m.rateLimiter.SetBytesPerSec(m.rateLimiter.BytesPerSec() + 0.5*bytesPerMiB)
-			return m, nil
-		}
-		if key.Matches(msg, m.keys.RateDown) {
-			if !m.rateLimiter.Enabled() {
-				m.rateLimiter.SetEnabled(true)
-			}
-			next := m.rateLimiter.BytesPerSec() - 0.5*bytesPerMiB
-			if next < 0.5*bytesPerMiB {
-				next = 0.5 * bytesPerMiB
-			}
-			m.rateLimiter.SetBytesPerSec(next)
-			return m, nil
-		}
-		if msg.String() == "0" {
-			m.rateLimiter.SetEnabled(false)
-			return m, nil
-		}
+		// Quit is always available. While running or extracting, it
+		// cancels the in-flight goroutine; after completion (and not
+		// extracting), it ends the program outright.
 		if key.Matches(msg, m.keys.Quit) {
 			if m.cancel != nil {
 				m.cancel()
 				m.cancel = nil
+				return m, nil
 			}
-			return m, nil
+			return m, tea.Quit
 		}
+		if m.queueComplete {
+			return updateDownloadingComplete(m, msg)
+		}
+		return updateDownloadingRunning(m, msg)
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -405,10 +389,144 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateDownloadingRunning handles key input while queue.Run is in flight.
+// Holds every binding that mutates rate/extract toggles or drops into the
+// add-DLC sub-flow.
+func updateDownloadingRunning(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.AddDLC) {
+		// Drop into the picker screen in add mode. The queue keeps
+		// running in its goroutine; the event channel keeps draining
+		// because waitForEvent re-arms itself after every message.
+		m.addMode = true
+		m.addReturnTo = screenDownloading
+		m.err = nil
+		m.parseBanner = ""
+		m.pathInput.Reset()
+		m.pathInput.Focus()
+		m.links = nil
+		m.selected = nil
+		m.screen = screenPicker
+		return m, tea.Batch(textinput.Blink, m.parseSpinner.Tick)
+	}
+	if key.Matches(msg, m.keys.RateToggle) {
+		m.rateLimiter.SetEnabled(!m.rateLimiter.Enabled())
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.ExtractToggle) {
+		m.extractToggle.SetEnabled(!m.extractToggle.Enabled())
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.RateUp) {
+		if !m.rateLimiter.Enabled() {
+			m.rateLimiter.SetEnabled(true)
+		}
+		m.rateLimiter.SetBytesPerSec(m.rateLimiter.BytesPerSec() + 0.5*bytesPerMiB)
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.RateDown) {
+		if !m.rateLimiter.Enabled() {
+			m.rateLimiter.SetEnabled(true)
+		}
+		next := m.rateLimiter.BytesPerSec() - 0.5*bytesPerMiB
+		if next < 0.5*bytesPerMiB {
+			next = 0.5 * bytesPerMiB
+		}
+		m.rateLimiter.SetBytesPerSec(next)
+		return m, nil
+	}
+	if msg.String() == "0" {
+		m.rateLimiter.SetEnabled(false)
+		return m, nil
+	}
+	return m, nil
+}
+
+// updateDownloadingComplete handles key input after queue.Run has returned.
+// `e` runs the extract-now pass over completedFiles; `r` reruns the failed
+// set; `esc` resets the model to the picker; `a` opens the add-DLC flow
+// (which routes through startBatch instead of appendBatch since the runner
+// has exited).
+func updateDownloadingComplete(m model, msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Reject everything while a post-completion extract pass is running —
+	// only Quit (handled above) can interrupt it. Letting other keys fire
+	// here would race the events channel and produce ghost transitions.
+	if m.extractingNow {
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.ExtractToggle) {
+		return startExtractCompleted(m)
+	}
+	if key.Matches(msg, m.keys.Rerun) {
+		if len(m.failedJobs) == 0 {
+			return m, nil
+		}
+		retry := m.failedJobs
+		m.resetBatchState()
+		m.jobs = retry
+		return startBatch(m)
+	}
+	if key.Matches(msg, m.keys.Back) {
+		m.screen = screenPicker
+		m.links = nil
+		m.selected = nil
+		m.registry = newDisplayRegistry()
+		m.accounts = nil
+		m.parseBanner = ""
+		m.pathInput.Reset()
+		m.resetBatchState()
+		return m, nil
+	}
+	if key.Matches(msg, m.keys.AddDLC) {
+		m.addMode = true
+		m.addReturnTo = screenDownloading
+		m.err = nil
+		m.parseBanner = ""
+		m.pathInput.Reset()
+		m.pathInput.Focus()
+		m.links = nil
+		m.selected = nil
+		m.screen = screenPicker
+		return m, tea.Batch(textinput.Blink, m.parseSpinner.Tick)
+	}
+	return m, nil
+}
+
+// startExtractCompleted spins up a goroutine running Runner.ExtractCompleted
+// over the session's successful downloads, swaps the model's event/cancel
+// handles to the new pair, and primes the same waitForEvent / waitForDone
+// commands the download path uses. The completion banner branches on
+// extractingNow to show "EXTRACTING…" while this pass runs; queueDoneMsg
+// will land in the root Update and flip back to "COMPLETE".
+func startExtractCompleted(m model) (tea.Model, tea.Cmd) {
+	if m.runner == nil || len(m.completedFiles) == 0 {
+		return m, nil
+	}
+	files := append([]queue.CompletedFile(nil), m.completedFiles...)
+	cancel, events, errs := runExtractCompleted(context.Background(), m.runner, files)
+	m.cancel = cancel
+	m.events = events
+	m.errs = errs
+	m.extractingNow = true
+	// Re-arm the cancellation flag so a prior cancelled-during-download
+	// banner doesn't carry over: this is a fresh user action.
+	m.cancelled = false
+	m.summaryErr = nil
+	// downSpinner has been self-ticking since the initial startBatch and
+	// keeps doing so through completion; starting a second Tick loop here
+	// would double its animation rate, so we only prime the event/done
+	// pumps for the new goroutine.
+	return m, tea.Batch(
+		waitForEvent(events),
+		waitForDone(errs),
+	)
+}
+
 // viewDownloading renders the active job panel on top and the batches
 // table below. The active panel shows the currently downloading file with
-// progress / speed / ETA; the batches table tracks every queued .dlc with
-// its source, first file, file count, and per-batch status.
+// progress / speed / ETA while the queue is running; once the queue has
+// returned (m.queueComplete) the same slot becomes a completion banner
+// (COMPLETE / CANCELLED / EXTRACTING…) with done/skipped/failed counters
+// and an optional error tail. The batches table is always visible.
 func viewDownloading(m model) string {
 	th := m.theme
 
@@ -419,6 +537,29 @@ func viewDownloading(m model) string {
 	if contentW < 20 {
 		contentW = 20
 	}
+
+	var panel string
+	if m.queueComplete {
+		panel = renderCompletionPanel(m, contentW)
+	} else {
+		panel = renderActivePanel(m, contentW)
+	}
+
+	batchesHeader := th.Subtitle.Render("batches:")
+	batchesTable := renderBatchesTable(&m)
+
+	hintLine1, hintLine2 := renderHintLines(m)
+
+	parts := []string{panel, "", batchesHeader, batchesTable, "", hintLine1, hintLine2}
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// renderActivePanel draws the in-flight download panel: header, progress
+// bar, speed/ETA stats, the auto-extract and rate-limit indicators, and
+// the batch-wide progress bar. contentW is the width budget inside the
+// outer Panel border.
+func renderActivePanel(m model, contentW int) string {
+	th := m.theme
 
 	headerPrefix := fmt.Sprintf("%s [%d/%d]  %s  ",
 		m.downSpinner.View(),
@@ -509,18 +650,79 @@ func viewDownloading(m model) string {
 		"",
 		pb.View()+"  "+batchLabel,
 	)
-	activePanel := th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left, activeRows...))
+	return th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left, activeRows...))
+}
 
-	batchesHeader := th.Subtitle.Render("batches:")
-	batchesTable := renderBatchesTable(&m)
+// renderCompletionPanel replaces the active-job panel once queue.Run has
+// returned. While an extract-now pass is running it shows the current
+// archive and 7zz progress instead of the COMPLETE banner.
+func renderCompletionPanel(m model, contentW int) string {
+	th := m.theme
 
-	// Two lines so the hint fits inside the 80-column minimum without
-	// wrapping mid-token: rate controls on top, extract + lifecycle below.
-	hintLine1 := th.Muted.Render("l: limit · +/-: rate · 0: off")
-	hintLine2 := th.Muted.Render("e: auto-extract · a: add dlc · q / ctrl+c: cancel")
+	header := "COMPLETE"
+	headerStyle := th.Success
+	switch {
+	case m.extractingNow:
+		header = "EXTRACTING…"
+		headerStyle = th.Accent
+	case m.cancelled:
+		header = "CANCELLED"
+		headerStyle = th.Skip
+	case m.failed > 0:
+		headerStyle = th.Error
+	}
 
-	parts := []string{activePanel, "", batchesHeader, batchesTable, "", hintLine1, hintLine2}
-	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+	doneText := th.Success.Render(fmt.Sprintf("✓ %d done", m.done))
+	skipText := th.Skip.Render(fmt.Sprintf("⊘ %d skipped", m.skipped))
+	failText := th.Error.Render(fmt.Sprintf("✗ %d failed", m.failed))
+	counters := lipgloss.JoinHorizontal(lipgloss.Top,
+		doneText, "   ", skipText, "   ", failText)
+
+	rows := []string{
+		headerStyle.Render(header),
+		"",
+		counters,
+	}
+
+	if m.extractingNow {
+		label := m.active.extractFile
+		if label == "" {
+			label = "archive"
+		}
+		// Truncate so the line fits inside the panel content width.
+		lineW := contentW - 14 // "extracting: " + " NN%"
+		if lineW < 10 {
+			lineW = 10
+		}
+		extractLine := th.Muted.Render("extracting: ") +
+			th.Accent.Render(fmt.Sprintf("%s  %d%%", truncate(label, lineW), m.active.extractPct))
+		rows = append(rows, "", extractLine)
+	}
+
+	if m.summaryErr != nil && !errors.Is(m.summaryErr, context.Canceled) {
+		rows = append(rows, "", th.Muted.Render(truncate(m.summaryErr.Error(), contentW)))
+	}
+
+	return th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left, rows...))
+}
+
+// renderHintLines returns the two-line hint footer for the downloading
+// screen. The first line is always present so the layout doesn't twitch
+// when the queue completes; the second swaps between the running-state
+// rate/extract bindings and the completion-state recovery bindings.
+func renderHintLines(m model) (string, string) {
+	th := m.theme
+	switch {
+	case m.extractingNow:
+		return th.Muted.Render("extracting downloaded archives…"),
+			th.Muted.Render("q / ctrl+c: cancel")
+	case m.queueComplete:
+		return th.Muted.Render("e: extract files · a: add dlc · r: rerun failed"),
+			th.Muted.Render("esc: new dlc · q / ctrl+c: quit")
+	default:
+		return th.Muted.Render("l: limit · +/-: rate · 0: off"),
+			th.Muted.Render("e: auto-extract · a: add dlc · q / ctrl+c: cancel")
+	}
 }
 
 // renderRateLimit returns the single-line "rate limit: …" indicator shown
@@ -625,77 +827,6 @@ func padRight(s string, w int) string {
 		return s
 	}
 	return s + strings.Repeat(" ", w-visible)
-}
-
-// updateSummary handles input on the summary screen.
-func updateSummary(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, m.keys.Quit):
-			return m, tea.Quit
-		case key.Matches(msg, m.keys.Back):
-			m.screen = screenPicker
-			m.links = nil
-			m.selected = nil
-			m.registry = newDisplayRegistry()
-			m.accounts = nil
-			m.parseBanner = ""
-			m.pathInput.Reset()
-			m.resetBatchState()
-			return m, nil
-		case key.Matches(msg, m.keys.Rerun):
-			if len(m.failedJobs) == 0 {
-				return m, nil
-			}
-			retry := m.failedJobs
-			m.resetBatchState()
-			m.jobs = retry
-			return startBatch(m)
-		}
-	}
-	return m, nil
-}
-
-// viewSummary renders the centred completion banner.
-func viewSummary(m model) string {
-	th := m.theme
-
-	header := "COMPLETE"
-	headerStyle := th.Success
-	if m.cancelled {
-		header = "CANCELLED"
-		headerStyle = th.Skip
-	} else if m.failed > 0 {
-		headerStyle = th.Error
-	}
-
-	doneText := th.Success.Render(fmt.Sprintf("✓ %d done", m.done))
-	skipText := th.Skip.Render(fmt.Sprintf("⊘ %d skipped", m.skipped))
-	failText := th.Error.Render(fmt.Sprintf("✗ %d failed", m.failed))
-
-	counters := lipgloss.JoinHorizontal(lipgloss.Top,
-		doneText, "   ", skipText, "   ", failText)
-
-	hints := th.Muted.Render("q quit · r rerun failed · esc new dlc")
-
-	banner := th.Banner.Render(lipgloss.JoinVertical(lipgloss.Center,
-		headerStyle.Render(header),
-		"",
-		counters,
-		"",
-		hints,
-	))
-
-	if m.summaryErr != nil && !errors.Is(m.summaryErr, context.Canceled) {
-		banner = lipgloss.JoinVertical(lipgloss.Center,
-			banner,
-			"",
-			th.Muted.Render(m.summaryErr.Error()),
-		)
-	}
-
-	return lipgloss.Place(m.innerWidth(), 0, lipgloss.Center, lipgloss.Top, banner)
 }
 
 // startBatch builds the job slice from the current selection, spins up the
@@ -894,6 +1025,16 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 			b.done++
 		}
 		m.done++
+		// Track every successful download so the post-completion `e` key
+		// can hand the list to Runner.ExtractCompleted. DestPath is the
+		// authoritative source for both the directory and filename —
+		// deriving from it survives any future per-batch OutDir change.
+		if ev.DestPath != "" {
+			m.completedFiles = append(m.completedFiles, queue.CompletedFile{
+				OutDir:   filepath.Dir(ev.DestPath),
+				Filename: filepath.Base(ev.DestPath),
+			})
+		}
 		// Total may have grown if a new batch was appended; keep the active
 		// figure in sync so the bottom progress bar reflects current totals.
 		m.active.total = ev.Total
@@ -917,6 +1058,18 @@ func applyQueueEvent(m *model, ev queue.Event) tea.Cmd {
 			b.skipped++
 		}
 		m.skipped++
+		// Collision-skipped files (destination already exists from a prior
+		// session) are still on disk, so include them in the extract-now
+		// list — the user's "I forgot to enable auto-extract" recovery is
+		// otherwise a no-op when every link was a re-run hit. Other skip
+		// reasons (no hoster) don't put a file on disk.
+		var collision *queue.ErrCollision
+		if ev.DestPath != "" && errors.As(ev.Err, &collision) {
+			m.completedFiles = append(m.completedFiles, queue.CompletedFile{
+				OutDir:   filepath.Dir(ev.DestPath),
+				Filename: filepath.Base(ev.DestPath),
+			})
+		}
 		m.active.total = ev.Total
 		return m.progressBatch.SetPercent(m.batchPct())
 

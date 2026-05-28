@@ -634,6 +634,113 @@ func TestRun_ExtractMultiVolumeIncomplete(t *testing.T) {
 	}
 }
 
+// TestRun_ExtractLegacyRarAllVolumesRemoved guards the legacy-RAR deletion
+// bug: when name.rar is the last file downloaded in a name.rar+name.rNN set,
+// the queue used to delete only name.rar because EnumerateVolumes saw
+// ArchiveSet("name.rar") as FormatRar single. With the extractor patched to
+// probe for legacy continuations when the trigger is a bare .rar, all
+// volumes must be removed after a successful extraction.
+//
+// 7zz identifies archive format by content, so we serve a valid zip as
+// "old.rar" — that lets the extraction step succeed without needing the
+// rar codec or a separate split-archive tool. The .r00/.r01 files are
+// dummy bytes; they exist purely so EnumerateVolumes can see them on disk.
+func TestRun_ExtractLegacyRarAllVolumesRemoved(t *testing.T) {
+	requireExtractor(t)
+
+	rarPayload := makeZipBytes(t, map[string][]byte{"hello.txt": []byte("hi")})
+	contPayload := []byte("filler")
+
+	files := map[string][]byte{
+		"old.r00": contPayload,
+		"old.r01": contPayload,
+		"old.rar": rarPayload,
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for name, data := range files {
+			if strings.HasSuffix(r.URL.Path, name) {
+				w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	h := &fakeHoster{
+		name: "fake",
+		resolve: func(ctx context.Context, link string) (hoster.Resolved, error) {
+			name := link[strings.LastIndex(link, "/")+1:]
+			if data, ok := files[name]; ok {
+				return hoster.Resolved{
+					DirectURL: srv.URL + "/" + name,
+					Filename:  name,
+					Size:      int64(len(data)),
+				}, nil
+			}
+			return hoster.Resolved{}, fmt.Errorf("unknown link %q", link)
+		},
+	}
+
+	// Order matters: old.rar last so the bug used to fire — the prior
+	// jobs stash in pending, then the .rar arrives, EnumerateVolumes runs
+	// in the FormatRar single branch, and runExtraction sweeps the
+	// volume list. Before the fix only old.rar was removed.
+	order := []string{"old.r00", "old.r01", "old.rar"}
+	jobs := make([]Job, len(order))
+	for i, name := range order {
+		jobs[i] = Job{
+			Link:   dlc.Link{URL: "https://example/" + name},
+			Hoster: h,
+			OutDir: dir,
+		}
+	}
+
+	runner := NewRunner(jobs)
+	runner.Extractor = extractor.NewToggle()
+	runner.Extractor.SetEnabled(true)
+
+	var (
+		mu     sync.Mutex
+		events []Event
+	)
+	if err := runner.Run(t.Context(), func(e Event) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	var started, done, failed int
+	for _, e := range events {
+		switch e.Kind {
+		case EventExtractStarted:
+			started++
+		case EventExtractDone:
+			done++
+		case EventExtractFailed:
+			failed++
+			t.Errorf("unexpected EventExtractFailed: %v", e.Err)
+		}
+	}
+	if started != 1 || done != 1 {
+		t.Errorf("extract events: started=%d done=%d failed=%d, want 1/1/0", started, done, failed)
+	}
+
+	for name := range files {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Errorf("volume %s should be removed; stat err = %v", name, err)
+		}
+	}
+}
+
 func TestRun_ExtractToggledMidRun(t *testing.T) {
 	requireExtractor(t)
 

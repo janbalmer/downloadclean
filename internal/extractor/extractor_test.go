@@ -202,6 +202,24 @@ func TestEnumerateVolumes(t *testing.T) {
 		}
 	})
 
+	t.Run("legacy rar trigger with continuations on disk", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		touch(t, filepath.Join(dir, "old.rar"))
+		touch(t, filepath.Join(dir, "old.r00"))
+		touch(t, filepath.Join(dir, "old.r01"))
+
+		// ArchiveSet("old.rar") yields FormatRar single (no pattern);
+		// EnumerateVolumes must still find the continuations on disk so
+		// the queue's deletion sweep clears every volume after extraction.
+		set := ArchiveSet("old.rar")
+		got := EnumerateVolumes(dir, set)
+		want := []string{"old.rar", "old.r00", "old.r01"}
+		if !slices.Equal(got, want) {
+			t.Errorf("EnumerateVolumes = %v, want %v", got, want)
+		}
+	})
+
 	t.Run("legacy rar gap in continuations", func(t *testing.T) {
 		t.Parallel()
 		dir := t.TempDir()

@@ -294,6 +294,16 @@ func EnumerateVolumes(dir string, set SetInfo) []string {
 		if set.pattern != nil {
 			return enumerateNumbered(entries, set, 1)
 		}
+		// A bare .rar may turn out to be the trigger of a legacy
+		// multi-volume set (name.rar + name.r00..rNN). ArchiveSet can't
+		// distinguish those from a true single-file .rar by name alone,
+		// so probe the directory: if continuations exist, treat the set
+		// as legacy so deletion sweeps every volume.
+		if set.Format == FormatRar {
+			if vols := enumerateLegacyRar(entries, set); len(vols) > 1 {
+				return vols
+			}
+		}
 		return enumerateSingle(entries, set)
 	case FormatRarLegacy:
 		return enumerateLegacyRar(entries, set)

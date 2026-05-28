@@ -90,6 +90,30 @@ func runQueue(parent context.Context, jobs []queue.Job, limiter *downloader.Rate
 	return runner, cancel, events, done
 }
 
+// runExtractCompleted launches Runner.ExtractCompleted on its own goroutine
+// for the "I forgot to enable auto-extract" workflow on the downloading
+// screen post-completion. The channel shape mirrors runQueue so the model's
+// existing waitForEvent / waitForDone commands and the cancel handle drop
+// in unchanged.
+func runExtractCompleted(parent context.Context, runner *queue.Runner, files []queue.CompletedFile) (
+	context.CancelFunc, <-chan queue.Event, <-chan error,
+) {
+	ctx, cancel := context.WithCancel(parent)
+	events := make(chan queue.Event, 64)
+	done := make(chan error, 1)
+
+	go func() {
+		err := runner.ExtractCompleted(ctx, files, func(e queue.Event) {
+			events <- e
+		})
+		close(events)
+		done <- err
+		close(done)
+	}()
+
+	return cancel, events, done
+}
+
 // waitForEvent yields one event from the bridge. Returning nil on a closed
 // channel lets the runtime drop the message — waitForDone carries the
 // terminal signal so the model still transitions to the summary screen.
