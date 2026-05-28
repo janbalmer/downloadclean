@@ -364,16 +364,16 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			if !m.rateLimiter.Enabled() {
 				m.rateLimiter.SetEnabled(true)
 			}
-			m.rateLimiter.SetBytesPerSec(m.rateLimiter.BytesPerSec() + 0.5*bytesPerMbit)
+			m.rateLimiter.SetBytesPerSec(m.rateLimiter.BytesPerSec() + 0.5*bytesPerMiB)
 			return m, nil
 		}
 		if key.Matches(msg, m.keys.RateDown) {
 			if !m.rateLimiter.Enabled() {
 				m.rateLimiter.SetEnabled(true)
 			}
-			next := m.rateLimiter.BytesPerSec() - 0.5*bytesPerMbit
-			if next < 0.5*bytesPerMbit {
-				next = 0.5 * bytesPerMbit
+			next := m.rateLimiter.BytesPerSec() - 0.5*bytesPerMiB
+			if next < 0.5*bytesPerMiB {
+				next = 0.5 * bytesPerMiB
 			}
 			m.rateLimiter.SetBytesPerSec(next)
 			return m, nil
@@ -498,8 +498,8 @@ func renderRateLimit(th Theme, lim *downloader.RateLimiter) string {
 	if !lim.Enabled() {
 		return th.Muted.Render("rate limit: off")
 	}
-	mbit := lim.BytesPerSec() / bytesPerMbit
-	return th.Muted.Render("rate limit: ") + th.Accent.Render(fmt.Sprintf("%.1f Mbit/s", mbit))
+	mib := lim.BytesPerSec() / bytesPerMiB
+	return th.Muted.Render("rate limit: ") + th.Accent.Render(fmt.Sprintf("%.1f MiB/s", mib))
 }
 
 // renderExtract returns the single-line "auto-extract: …" indicator shown

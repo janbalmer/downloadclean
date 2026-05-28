@@ -23,10 +23,11 @@ import (
 	"github.com/janbalmer/downloadclean/internal/queue"
 )
 
-// bytesPerMbit is the byte-per-second equivalent of one decimal megabit per
-// second. Used to translate the user-facing Mbit/s cap into the bytes-per-
-// second value the rate limiter expects.
-const bytesPerMbit = 125_000.0
+// bytesPerMiB is the byte-per-second equivalent of one binary mebibyte per
+// second. Used to translate the user-facing MiB/s cap into the bytes-per-
+// second value the rate limiter expects; matches the 1024-base units the
+// downloading screen uses for live throughput via [humanSize].
+const bytesPerMiB = 1024.0 * 1024.0
 
 // screen identifies which page the model is showing.
 type screen int
@@ -127,8 +128,8 @@ func newKeyMap() keyMap {
 		Rerun:         key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rerun failed")),
 		AddDLC:        key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add dlc")),
 		RateToggle:    key.NewBinding(key.WithKeys("l"), key.WithHelp("l", "rate limit")),
-		RateUp:        key.NewBinding(key.WithKeys("+", "="), key.WithHelp("+", "+0.5 Mbit/s")),
-		RateDown:      key.NewBinding(key.WithKeys("-", "_"), key.WithHelp("-", "-0.5 Mbit/s")),
+		RateUp:        key.NewBinding(key.WithKeys("+", "="), key.WithHelp("+", "+0.5 MiB/s")),
+		RateDown:      key.NewBinding(key.WithKeys("-", "_"), key.WithHelp("-", "-0.5 MiB/s")),
 		ExtractToggle: key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "auto-extract")),
 	}
 }
@@ -249,7 +250,7 @@ func newModel(f flags, cfg *config.Config) model {
 	)
 
 	rl := downloader.NewRateLimiter()
-	rl.SetBytesPerSec(10.0 * bytesPerMbit)
+	rl.SetBytesPerSec(10.0 * bytesPerMiB)
 
 	// Extraction starts disabled — the user opts in with `e` on the
 	// downloading screen. Passwords come from config.json so the user can
