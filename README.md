@@ -4,19 +4,52 @@ A small, JDownloader-style sequential link downloader written in Go.
 
 The goal is a focused subset of what JDownloader 2 does — read a `.dlc`
 container, resolve each link with a hoster account, download files one after
-another. Ships a plain CLI and a Bubble Tea TUI with a Japan-cyberpunk palette.
+another. Ships a plain CLI and a Bubble Tea TUI with a neon palette.
 
-## Status
+## Features
 
-Early prototype. Both front-ends support:
+Both front-ends share the same `internal/` packages and offer:
 
-- `.dlc` parsing (two-stage AES-CBC, via the AppWork dlcrypt service).
-- **rapidgator.net premium** via the official v2 API.
-- Sequential downloads with HTTP `Range` resume.
-- XDG-aware default paths, overridable on the command line.
+- **`.dlc` containers.** Two-stage AES-CBC decryption against the AppWork
+  dlcrypt service. The service endpoint is overridable via
+  `DOWNLOADCLEAN_DLC_SERVICE` if AppWork's default is unreachable.
+- **Rapidgator premium.** Authenticates against the official v2 API,
+  resolves direct download URLs, and surfaces server-side errors verbatim.
+  Free-tier (captcha / wait timers) is out of scope.
+- **Sequential downloads with HTTP `Range` resume.** Each transfer streams
+  to `<dest>.part` and is atomically renamed on success. Cancelling a run
+  leaves the `.part` on disk so the next run picks up where it stopped.
+- **Collision-safe writes.** The queue refuses to overwrite an existing
+  destination file and reports the conflict so the TUI can offer
+  overwrite/rename. Path separators in hoster-returned filenames are
+  stripped to keep writes inside `--output`.
+- **Hardened config loader.** On Unix, `accounts.json` must be `chmod 600`,
+  not a symlink, with a parent directory that is not group- or
+  world-writable. All three checks can be bypassed with
+  `--insecure-config` for development.
+- **XDG paths.** Accounts default to `$XDG_CONFIG_HOME/downloadclean/`
+  and downloads to `$XDG_DOWNLOAD_DIR` (or `~/Downloads`), both
+  overridable on the command line.
 
-Not yet supported: parallel downloads, free-tier handling (captcha/wait),
-RSDF/CCF containers, other hosters.
+The TUI adds on top:
+
+- **Four screens** — drop-zone picker, parsed-link selection table, live
+  download view, and a summary banner with rerun-failed and start-new
+  shortcuts.
+- **Drag-and-drop picker** that normalises `file://` URLs, percent-escapes,
+  surrounding quotes, and shell-escaped spaces. The fallback Tab-driven
+  file browser handles terminals that don't paste on drop.
+- **Live progress** with neon gradient bars for the current file and the
+  whole batch, smoothed transfer speed, ETA, and the destination
+  `<path>.part` shown beside the progress bar.
+- **Mid-download queueing.** Press `a` on the downloading screen to drop
+  another `.dlc` onto the running queue; each container shows up as its
+  own row in a batches table with per-batch counters.
+- **Rerun failed.** The summary screen retains the failed job list; one
+  keypress re-queues just those jobs.
+
+Not yet supported: parallel downloads, retry/backoff, bandwidth caps,
+free-tier flows, RSDF/CCF containers, persistent queue, additional hosters.
 
 ## Install
 
@@ -81,9 +114,11 @@ downloadclean-tui path/to/links.dlc     # skips the picker
 
 Four screens: a drop-zone picker, a checkbox table of parsed links, a live
 download view with neon progress bars + speed + ETA + a per-batch progress
-bar, and a summary screen with a one-key rerun-failed shortcut. Mouse left
-click toggles a link on the parsed screen; `q` cancels a running batch (the
-`.part` file is kept so the next run resumes from where it stopped).
+bar and a batches table, and a summary screen with a one-key rerun-failed
+shortcut. Mouse left click toggles a link on the parsed screen; `a` on the
+downloading screen queues another `.dlc` as a new batch; `q` cancels the
+running queue (the `.part` file is kept so the next run resumes from where
+it stopped).
 
 Drag-and-drop: drop a `.dlc` from your file manager onto the terminal window
 while the picker is focused, then press Enter. The TUI normalises common
@@ -101,7 +136,7 @@ Flags mirror the CLI's:
 | `--output`           | `$XDG_DOWNLOAD_DIR` or `~/Downloads`           |
 | `--insecure-config`  | skip the accounts-file permission checks       |
 
-The cyberpunk palette assumes a dark, truecolor-capable terminal. On
+The neon palette assumes a dark, truecolor-capable terminal. On
 256-colour terminals the look degrades gracefully but the magenta/violet
 gradient may collapse.
 
