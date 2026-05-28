@@ -36,6 +36,14 @@ func parseDLCCmd(path string) tea.Cmd {
 	}
 }
 
+// newDisplayRegistry returns a registry seeded with credential-less hoster
+// clients, suitable for URL→name lookups (e.g. the parsed-screen hoster
+// column) before the real accounts.json has been read. Resolve calls on
+// these clients will fail; only Name and Matches are usable here.
+func newDisplayRegistry() *hoster.Registry {
+	return hoster.NewRegistry(rapidgator.New("", ""))
+}
+
 // loadAccountsCmd reads accounts.json and builds a hoster registry seeded
 // with whatever hosters have credentials configured.
 func loadAccountsCmd(accountsPath string, insecure bool) tea.Cmd {

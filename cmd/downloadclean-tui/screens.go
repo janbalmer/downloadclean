@@ -140,7 +140,7 @@ func updatePicker(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Path != "" {
 			m.addSourcePath = msg.Path
 		}
-		m.table = buildLinkTable(m, m.innerWidth()-4)
+		m.table = buildLinkTable(m, m.innerWidth())
 		m.screen = screenParsed
 		return m, nil
 
@@ -412,16 +412,34 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 func viewDownloading(m model) string {
 	th := m.theme
 
-	header := fmt.Sprintf("%s [%d/%d]  %s  %s",
+	// Panel content has m.innerWidth() - 6 to play with: the frame consumes
+	// 6 cols (border + padding) and the panel consumes another 6 on top.
+	// Lines wider than this push the outer frame's right border off-screen.
+	contentW := m.innerWidth() - 6
+	if contentW < 20 {
+		contentW = 20
+	}
+
+	headerPrefix := fmt.Sprintf("%s [%d/%d]  %s  ",
 		m.downSpinner.View(),
 		m.active.index+1, m.active.total,
 		th.Accent.Render(m.active.hosterName),
-		m.active.filename,
 	)
+	filenameW := contentW - lipgloss.Width(headerPrefix)
+	if filenameW < 10 {
+		filenameW = 10
+	}
+	header := headerPrefix + truncate(m.active.filename, filenameW)
 
 	partLine := ""
 	if m.active.destPath != "" {
-		partLine = th.Muted.Render("→ " + m.active.destPath + ".part")
+		// "→ " (2) + path + ".part" (5) — truncate path from the start so the
+		// filename at the end stays visible when the directory chain is long.
+		pathW := contentW - 7
+		if pathW < 10 {
+			pathW = 10
+		}
+		partLine = th.Muted.Render("→ " + truncateStart(m.active.destPath, pathW) + ".part")
 	}
 
 	pct := 0.0
@@ -463,18 +481,33 @@ func viewDownloading(m model) string {
 	batchLabel := th.ProgressLabel.Render(
 		fmt.Sprintf("[%d/%d completed]", finished, m.active.total))
 
+	// Size both progress bars so "bar + 2 + label" matches the panel content
+	// width — otherwise the wider batch label pushes the panel (and the outer
+	// frame's right border) past the terminal edge. progress.Model is a value
+	// type, so a local copy lets us override Width without disturbing animation
+	// state on the model.
+	labelW := max(lipgloss.Width(pctLabel), lipgloss.Width(batchLabel))
+	barW := contentW - 2 - labelW
+	if barW < 10 {
+		barW = 10
+	}
+	pf := m.progressFile
+	pf.Width = barW
+	pb := m.progressBatch
+	pb.Width = barW
+
 	activeRows := []string{header}
 	if partLine != "" {
 		activeRows = append(activeRows, partLine)
 	}
 	activeRows = append(activeRows,
 		"",
-		m.progressFile.View()+"  "+pctLabel,
+		pf.View()+"  "+pctLabel,
 		stats,
 		renderExtract(th, m.extractToggle, m.active),
 		renderRateLimit(th, m.rateLimiter),
 		"",
-		m.progressBatch.View()+"  "+batchLabel,
+		pb.View()+"  "+batchLabel,
 	)
 	activePanel := th.Panel.Render(lipgloss.JoinVertical(lipgloss.Left, activeRows...))
 
@@ -554,7 +587,11 @@ func renderBatchesTable(m *model) string {
 		padRight("files", filesW),
 		padRight("status", statusW),
 	}
-	headerLine := th.TableHeader.Render(strings.Join(headerCells, "  "))
+	// TableHeader's Padding(0, 1) is meant for bubbles/table, which applies
+	// the style per cell — here we render the whole header line as one
+	// string, so the same padding would add 2 cols and wrap past the frame.
+	// Strip it for this manual rendering.
+	headerLine := th.TableHeader.UnsetPadding().Render(strings.Join(headerCells, "  "))
 
 	rows := []string{headerLine}
 	for i := range m.batches {
@@ -601,7 +638,7 @@ func updateSummary(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.screen = screenPicker
 			m.links = nil
 			m.selected = nil
-			m.registry = nil
+			m.registry = newDisplayRegistry()
 			m.accounts = nil
 			m.parseBanner = ""
 			m.pathInput.Reset()
@@ -932,15 +969,24 @@ func (m *model) batchPct() float64 {
 }
 
 // buildLinkTable constructs the parsed-screen table with the configured
-// column widths sized to the available terminal width.
+// column widths sized to the available terminal width. width is the budget
+// for the rendered table (headers + rows), and column widths are chosen so
+// the total — including the per-cell padding bubbles/table adds via its
+// Header/Cell styles — fits exactly.
 func buildLinkTable(m model, width int) table.Model {
 	width = max(width, 60)
-	checkW := 3
-	idxW := 4
-	sizeW := 10
-	hosterW := 12
-	pkgW := 14
-	nameW := width - checkW - idxW - sizeW - hosterW - pkgW - 6
+	const (
+		checkW  = 3
+		idxW    = 4
+		sizeW   = 10
+		hosterW = 12
+		pkgW    = 14
+		// bubbles/table wraps every cell with the Header/Cell style, which
+		// has Padding(0, 1). That adds 2 cols per column on top of col.Width;
+		// account for all six up front so nameW absorbs the remainder cleanly.
+		cellPads = 6 * 2
+	)
+	nameW := width - checkW - idxW - sizeW - hosterW - pkgW - cellPads
 	if nameW < 10 {
 		nameW = 10
 	}
@@ -1026,4 +1072,21 @@ func truncate(s string, n int) string {
 		return string(r[:n])
 	}
 	return string(r[:n-1]) + "…"
+}
+
+// truncateStart clips s to n runes from the start, prefixing an ellipsis if
+// it was shortened. Useful for paths where the trailing component (filename)
+// is more informative than the leading directory chain.
+func truncateStart(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	if n < 2 {
+		return string(r[len(r)-n:])
+	}
+	return "…" + string(r[len(r)-(n-1):])
 }

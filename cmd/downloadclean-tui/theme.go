@@ -75,7 +75,6 @@ func NewTheme() Theme {
 		TableRowMuted: lipgloss.NewStyle().Foreground(lipgloss.Color(HexMuted)).Padding(0, 1),
 		TableSelected: lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#000000")).
-			Background(lipgloss.Color(HexHotPink)).
-			Padding(0, 1),
+			Background(lipgloss.Color(HexHotPink)),
 	}
 }

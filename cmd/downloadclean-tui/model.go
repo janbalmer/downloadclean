@@ -280,6 +280,7 @@ func newModel(f flags, cfg *config.Config) model {
 		progressBatch: pb,
 		rateLimiter:   rl,
 		extractToggle: et,
+		registry:      newDisplayRegistry(),
 		keys:          newKeyMap(),
 		help:          h,
 	}
@@ -312,15 +313,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			inputWidth = 20
 		}
 		m.pathInput.Width = inputWidth
-		barWidth := msg.Width - 20
-		if barWidth < 20 {
-			barWidth = 20
-		}
-		m.progressFile.Width = barWidth
-		m.progressBatch.Width = barWidth
+		// Progress-bar widths are set per-render in viewDownloading so they
+		// can be sized against the actual labels they sit next to.
 		if m.screen == screenParsed {
-			m.table.SetWidth(msg.Width - 8)
-			m.table.SetHeight(maxInt(msg.Height-12, 6))
+			// Rebuild so column widths track the new terminal size; the
+			// selection mask lives on the model so it survives the rebuild.
+			cursor := m.table.Cursor()
+			m.table = buildLinkTable(m, m.innerWidth())
+			m.table.SetCursor(cursor)
 		}
 	case tea.KeyMsg:
 		if m.screen != screenPicker && key.Matches(msg, m.keys.Help) {
@@ -410,7 +410,15 @@ func (m model) View() string {
 		"",
 		helpView,
 	)
-	return m.theme.Frame.Render(frame)
+	// Pin the frame's outer width to the terminal width so the right border
+	// lands at the last column regardless of how wide the children render.
+	// In lipgloss, Style.Width sets content+padding; the border is added on
+	// top — so we pass m.width minus the border to land at exactly m.width.
+	frameW := m.width - m.theme.Frame.GetHorizontalBorderSize()
+	if frameW < 20 {
+		frameW = 20
+	}
+	return m.theme.Frame.Width(frameW).Render(frame)
 }
 
 // innerWidth returns the renderable column count inside the outer frame's
