@@ -385,6 +385,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tickCmd()
 		}
 		return m, nil
+
+	// Spinner ticks are dispatched here rather than per-screen so the parse
+	// and download spinners animate independently of the active screen. Each
+	// tick is offered to both spinners; the one whose ID matches advances and
+	// re-arms, the other rejects it and returns nil. Routing per-screen
+	// instead meant that opening the add-DLC picker mid-download fed the
+	// download spinner's tick into the parse spinner, which dropped the
+	// foreign ID and silently killed the download spinner's tick loop.
+	case spinner.TickMsg:
+		var cmds []tea.Cmd
+		var cmd tea.Cmd
+		m.parseSpinner, cmd = m.parseSpinner.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		m.downSpinner, cmd = m.downSpinner.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+		return m, tea.Batch(cmds...)
 	}
 
 	switch m.screen {

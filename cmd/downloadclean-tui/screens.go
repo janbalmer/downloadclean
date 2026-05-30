@@ -10,7 +10,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/progress"
-	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/table"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -124,11 +123,6 @@ func updatePicker(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.pathInput, cmd = m.pathInput.Update(msg)
-		return m, cmd
-
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.parseSpinner, cmd = m.parseSpinner.Update(msg)
 		return m, cmd
 
 	case dlcParsedMsg:
@@ -373,11 +367,6 @@ func updateDownloading(m model, msg tea.Msg) (tea.Model, tea.Cmd) {
 			return updateDownloadingComplete(m, msg)
 		}
 		return updateDownloadingRunning(m, msg)
-
-	case spinner.TickMsg:
-		var cmd tea.Cmd
-		m.downSpinner, cmd = m.downSpinner.Update(msg)
-		return m, cmd
 
 	case progress.FrameMsg:
 		pmFile, cmdF := m.progressFile.Update(msg)
